@@ -44,9 +44,12 @@ SEARCH_KEYWORDS = [
 ]
 
 SOURCE_LABELS = {
-    "zakupki": "Госзакупки (zakupki.gov.ru)",
-    "rts":     "РТС-тендер",
-    "etpgpb":  "ЭТП ГПБ",
+    "zakupki":   "Госзакупки (zakupki.gov.ru)",
+    "rts":       "РТС-тендер",
+    "etpgpb":    "ЭТП ГПБ",
+    "rostender": "РосТендер",
+    "synapse":   "Синапс",
+    "kontur":    "Контур.Закупки",
 }
 
 HEADERS = {
@@ -505,6 +508,207 @@ async def parse_etpgpb() -> list[dict]:
     return results
 
 
+
+
+# ── rostender.info ──────────────────────────────────────────
+
+async def parse_rostender() -> list[dict]:
+    results, seen = [], set()
+    urls = [
+        "https://rostender.info/tendery-metallicheskie-othody-i-lom",
+        "https://rostender.info/category/tendery-lom-chernyh-metallov",
+        "https://rostender.info/category/tendery-vyvoz-metalloloma",
+    ]
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            for page in range(1, MAX_PAGES + 1):
+                try:
+                    page_url = url if page == 1 else f"{url}?page={page}"
+                    async with session.get(
+                        page_url, headers=HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    cards = soup.select("div.tender-item, article.tender, div.lot-row, tr.tender")
+                    if not cards:
+                        # Try generic links
+                        cards = soup.select("div.views-row, div.node--tender")
+                    if not cards:
+                        break
+                    for card in cards:
+                        try:
+                            link = card.select_one("a[href*='/tender/'], a.tender-link, h3 a, h2 a")
+                            if not link:
+                                continue
+                            href = link.get("href", "")
+                            if not href:
+                                continue
+                            full_url = href if href.startswith("http") else "https://rostender.info" + href
+                            number = href.rstrip("/").split("/")[-1]
+                            eid = f"rostender_{number}"
+                            if eid in seen:
+                                continue
+                            seen.add(eid)
+                            title = link.get_text(strip=True) or "Тендер на металлолом"
+                            price_tag = card.select_one("span.price, div.price, .field-price")
+                            price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
+                            region_tag = card.select_one("span.region, div.region, .field-region")
+                            region = region_tag.get_text(strip=True) if region_tag else None
+                            deadline_tag = card.select_one("span.date, div.date, .field-date")
+                            deadline = deadline_tag.get_text(strip=True) if deadline_tag else None
+                            results.append({
+                                "external_id": eid, "source": "rostender",
+                                "title": title, "region": region,
+                                "start_price": price, "published": None,
+                                "deadline": deadline, "url": full_url, "status": "active",
+                            })
+                        except Exception:
+                            pass
+                    await asyncio.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    logger.error("rostender error: %s", e)
+                    break
+    logger.info("rostender: %d тендеров", len(results))
+    return results
+
+
+# ── synapsenet.ru ───────────────────────────────────────────
+
+async def parse_synapse() -> list[dict]:
+    results, seen = [], set()
+    base = "https://synapsenet.ru/search/category/metallolom"
+    async with aiohttp.ClientSession() as session:
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                params = {"page": page}
+                async with session.get(
+                    base, params=params, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("div.tender-item, div.search-item, tr.tender-row, div.lot")
+                if not cards:
+                    break
+                for card in cards:
+                    try:
+                        link = card.select_one("a[href*='/tender'], a[href*='/zakupka'], a.title-link, h3 a")
+                        if not link:
+                            continue
+                        href = link.get("href", "")
+                        full_url = href if href.startswith("http") else "https://synapsenet.ru" + href
+                        number = href.rstrip("/").split("/")[-1]
+                        eid = f"synapse_{number}"
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        title = link.get_text(strip=True) or "Тендер на металлолом"
+                        price_tag = card.select_one("span.price, .tender-price, .nmck")
+                        price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
+                        region_tag = card.select_one("span.region, .tender-region, .location")
+                        region = region_tag.get_text(strip=True) if region_tag else None
+                        deadline_tag = card.select_one("span.deadline, .tender-date, .date-end")
+                        deadline = deadline_tag.get_text(strip=True) if deadline_tag else None
+                        results.append({
+                            "external_id": eid, "source": "synapse",
+                            "title": title, "region": region,
+                            "start_price": price, "published": None,
+                            "deadline": deadline, "url": full_url, "status": "active",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.error("synapse error: %s", e)
+                break
+    logger.info("synapse: %d тендеров", len(results))
+    return results
+
+
+# ── zakupki.kontur.ru ───────────────────────────────────────
+
+async def parse_kontur() -> list[dict]:
+    results, seen = [], set()
+    async with aiohttp.ClientSession() as session:
+        for kw in ["металлолом", "лом черных металлов", "лом цветных металлов"]:
+            for page in range(1, MAX_PAGES + 1):
+                try:
+                    params = {"keyword": kw, "page": page, "status": "publish"}
+                    async with session.get(
+                        "https://zakupki.kontur.ru/api/search/lots",
+                        params=params, headers=HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            break
+                        try:
+                            data = await resp.json(content_type=None)
+                        except Exception:
+                            html = await resp.text()
+                            soup = BeautifulSoup(html, "html.parser")
+                            cards = soup.select("div.lot-card, div.tender-item, article.lot")
+                            if not cards:
+                                break
+                            for card in cards:
+                                try:
+                                    link = card.select_one("a[href*='/lot/'], a[href*='/tender/'], h3 a")
+                                    if not link:
+                                        continue
+                                    href = link.get("href", "")
+                                    full_url = href if href.startswith("http") else "https://zakupki.kontur.ru" + href
+                                    number = href.rstrip("/").split("/")[-1]
+                                    eid = f"kontur_{number}"
+                                    if eid in seen:
+                                        continue
+                                    seen.add(eid)
+                                    title = link.get_text(strip=True) or kw
+                                    price_tag = card.select_one("span.price, .nmck, .lot-price")
+                                    price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
+                                    region_tag = card.select_one("span.region, .lot-region")
+                                    region = region_tag.get_text(strip=True) if region_tag else None
+                                    results.append({
+                                        "external_id": eid, "source": "kontur",
+                                        "title": title, "region": region,
+                                        "start_price": price, "published": None,
+                                        "deadline": None, "url": full_url, "status": "active",
+                                    })
+                                except Exception:
+                                    pass
+                            break
+                        # JSON ответ
+                        lots = data.get("lots", data.get("items", data.get("results", [])))
+                        if not lots:
+                            break
+                        for lot in lots:
+                            try:
+                                eid = f"kontur_{lot.get('id', '')}"
+                                if eid in seen:
+                                    continue
+                                seen.add(eid)
+                                results.append({
+                                    "external_id": eid, "source": "kontur",
+                                    "title": lot.get("name", kw),
+                                    "region": lot.get("region", lot.get("regionName")),
+                                    "start_price": _clean_price(str(lot.get("maxPrice", ""))),
+                                    "published": lot.get("publishDate"),
+                                    "deadline": lot.get("submissionCloseDateTime"),
+                                    "url": f"https://zakupki.kontur.ru/lot/{lot.get('id','')}",
+                                    "status": "active",
+                                })
+                            except Exception:
+                                pass
+                    await asyncio.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    logger.error("kontur error: %s", e)
+                    break
+    logger.info("kontur: %d тендеров", len(results))
+    return results
+
 # ═══════════════════════════════════════════════════════════
 #  ПЛАНИРОВЩИК + УВЕДОМЛЕНИЯ
 # ═══════════════════════════════════════════════════════════
@@ -512,7 +716,7 @@ async def parse_etpgpb() -> list[dict]:
 async def run_all_parsers(bot: Bot):
     logger.info("=== Запуск парсеров: %s ===", datetime.now().strftime("%d.%m.%Y %H:%M"))
     all_tenders = []
-    for parser in [parse_zakupki, parse_rts, parse_etpgpb]:
+    for parser in [parse_zakupki, parse_rts, parse_etpgpb, parse_rostender, parse_synapse, parse_kontur]:
         try:
             all_tenders.extend(await parser())
         except Exception as e:
