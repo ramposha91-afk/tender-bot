@@ -394,118 +394,129 @@ async def parse_zakupki() -> list[dict]:
     return results
 
 
-# ── rts-tender.ru ───────────────────────────────────────────
+# ── RSS zakupki.gov.ru (работает с любого IP) ──────────────
 
 async def parse_rts() -> list[dict]:
+    """Парсит RSS-ленту zakupki.gov.ru — работает без блокировок."""
     results, seen = [], set()
+    # RSS-фиды zakupki.gov.ru доступны без ограничений по IP
+    rss_urls = [
+        "https://zakupki.gov.ru/epz/order/extendedsearch/rss.html?searchString=%D0%BC%D0%B5%D1%82%D0%B0%D0%BB%D0%BB%D0%BE%D0%BB%D0%BE%D0%BC&morphology=on&fz44=on&fz223=on",
+        "https://zakupki.gov.ru/epz/order/extendedsearch/rss.html?searchString=%D0%BB%D0%BE%D0%BC+%D1%87%D0%B5%D1%80%D0%BD%D1%8B%D1%85+%D0%BC%D0%B5%D1%82%D0%B0%D0%BB%D0%BB%D0%BE%D0%B2&morphology=on&fz44=on&fz223=on",
+        "https://zakupki.gov.ru/epz/order/extendedsearch/rss.html?searchString=%D0%BB%D0%BE%D0%BC+%D1%86%D0%B2%D0%B5%D1%82%D0%BD%D1%8B%D1%85+%D0%BC%D0%B5%D1%82%D0%B0%D0%BB%D0%BB%D0%BE%D0%B2&morphology=on&fz44=on&fz223=on",
+    ]
     async with aiohttp.ClientSession() as session:
-        for kw in SEARCH_KEYWORDS:
-            for page in range(1, MAX_PAGES + 1):
-                try:
-                    params = {"q": kw, "page": page, "perPage": 20}
-                    async with session.get(
-                        "https://tender.rts-tender.ru/tenders",
-                        params=params, headers=HEADERS,
-                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                    ) as resp:
-                        if resp.status != 200:
-                            break
-                        html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    rows = soup.select("div.tender-item, tr.tender-row, div.lot-item")
-                    if not rows:
-                        break
-                    for row in rows:
-                        try:
-                            num_tag = row.select_one("a.tender-number, a[href*='/tender/']")
-                            if not num_tag:
-                                continue
-                            number = num_tag.get_text(strip=True).strip("#").strip()
-                            eid = f"rts_{number}"
-                            if eid in seen:
-                                continue
-                            seen.add(eid)
-                            href = num_tag.get("href","")
-                            url = href if href.startswith("http") else "https://tender.rts-tender.ru" + href
-                            title_tag = row.select_one("div.tender-name, a.lot-name")
-                            title = title_tag.get_text(strip=True) if title_tag else kw
-                            price_tag = row.select_one("span.price, div.tender-price")
-                            price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
-                            region_tag = row.select_one("span.region, div.tender-region")
-                            region = region_tag.get_text(strip=True) if region_tag else None
-                            deadline_tag = row.select_one("span.deadline, div.tender-deadline")
-                            deadline = deadline_tag.get_text(strip=True) if deadline_tag else None
-                            results.append({
-                                "external_id": eid, "source": "rts",
-                                "title": title, "region": region,
-                                "start_price": price, "published": None,
-                                "deadline": deadline, "url": url, "status": "active",
-                            })
-                        except Exception:
-                            pass
-                    await asyncio.sleep(REQUEST_DELAY)
-                except Exception as e:
-                    logger.error("rts error: %s", e)
-                    break
-    logger.info("rts: %d тендеров", len(results))
+        for rss_url in rss_urls:
+            try:
+                async with session.get(
+                    rss_url, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning("RSS zakupki статус %s", resp.status)
+                        continue
+                    xml_text = await resp.text()
+                soup = BeautifulSoup(xml_text, "xml")
+                items = soup.find_all("item")
+                for item in items:
+                    try:
+                        title = item.find("title")
+                        title = title.get_text(strip=True) if title else "Тендер"
+                        link = item.find("link")
+                        url = link.get_text(strip=True) if link else ""
+                        # Номер из ссылки
+                        number = url.split("regNumber=")[-1].split("&")[0] if "regNumber=" in url else url.split("/")[-1]
+                        eid = f"zakupki_rss_{number}"
+                        if eid in seen or not number:
+                            continue
+                        seen.add(eid)
+                        desc = item.find("description")
+                        desc_text = desc.get_text(strip=True) if desc else ""
+                        # Извлекаем цену из описания
+                        price = None
+                        for part in desc_text.split():
+                            cleaned = part.replace(",","").replace(".","").replace(" ","")
+                            if cleaned.isdigit() and len(cleaned) > 4:
+                                price = float(cleaned)
+                                break
+                        pub_date = item.find("pubDate")
+                        published = pub_date.get_text(strip=True) if pub_date else None
+                        results.append({
+                            "external_id": eid, "source": "zakupki",
+                            "title": title, "region": None,
+                            "start_price": price, "published": published,
+                            "deadline": None, "url": url, "status": "active",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.error("RSS zakupki error: %s", e)
+    logger.info("zakupki RSS: %d тендеров", len(results))
     return results
 
 
-# ── etpgpb.ru ───────────────────────────────────────────────
+# ── Поиск через агрегатор ──────────────────────────────────
 
 async def parse_etpgpb() -> list[dict]:
+    """Парсит агрегатор zakupki.gov.ru через поисковый JSON-эндпоинт."""
     results, seen = [], set()
+    # Этот эндпоинт доступен без авторизации
+    base_url = "https://zakupki.gov.ru/epz/order/extendedsearch/results.html"
     async with aiohttp.ClientSession() as session:
-        for kw in SEARCH_KEYWORDS:
-            for page in range(1, MAX_PAGES + 1):
-                try:
-                    params = {"search": kw, "page": page, "status": "active"}
-                    async with session.get(
-                        "https://etpgpb.ru/procedures/",
-                        params=params, headers=HEADERS,
-                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                    ) as resp:
-                        if resp.status != 200:
-                            break
-                        html = await resp.text()
-                    soup = BeautifulSoup(html, "html.parser")
-                    cards = soup.select("div.procedure-item, div.lot-card, article.tender-card")
-                    if not cards:
-                        break
-                    for card in cards:
-                        try:
-                            link = card.select_one("a[href*='/procedures/'], a[href*='/lots/']")
-                            if not link:
-                                continue
-                            href = link.get("href","")
-                            number = href.rstrip("/").split("/")[-1]
-                            eid = f"etpgpb_{number}"
-                            if eid in seen:
-                                continue
-                            seen.add(eid)
-                            url = urljoin("https://etpgpb.ru", href)
-                            title_tag = card.select_one("div.procedure-name, h3.lot-title, a.procedure-link")
-                            title = title_tag.get_text(strip=True) if title_tag else kw
-                            price_tag = card.select_one("span.price, div.lot-price")
-                            price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
-                            region_tag = card.select_one("span.region, div.lot-region")
-                            region = region_tag.get_text(strip=True) if region_tag else None
-                            deadline_tag = card.select_one("span.end-date, div.date-end")
-                            deadline = deadline_tag.get_text(strip=True) if deadline_tag else None
-                            results.append({
-                                "external_id": eid, "source": "etpgpb",
-                                "title": title, "region": region,
-                                "start_price": price, "published": None,
-                                "deadline": deadline, "url": url, "status": "active",
-                            })
-                        except Exception:
-                            pass
-                    await asyncio.sleep(REQUEST_DELAY)
-                except Exception as e:
-                    logger.error("etpgpb error: %s", e)
-                    break
-    logger.info("etpgpb: %d тендеров", len(results))
+        for kw in ["металлолом", "лом черных металлов", "лом цветных металлов", "отходы металла"]:
+            try:
+                params = {
+                    "searchString": kw,
+                    "morphology": "on",
+                    "fz44": "on",
+                    "fz223": "on",
+                    "pageNumber": 1,
+                    "sortDirection": "false",
+                    "recordsPerPage": "_10",
+                }
+                async with session.get(
+                    base_url, params=params, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("div.search-registry-entry-block")
+                for card in cards:
+                    try:
+                        link = card.select_one("div.registry-entry__header-mid__number a")
+                        if not link:
+                            continue
+                        number = link.get_text(strip=True).replace("№","").strip()
+                        eid = f"gov_{number}"
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        url = "https://zakupki.gov.ru" + link.get("href","")
+                        title_tag = card.select_one("div.registry-entry__body-value")
+                        title = title_tag.get_text(strip=True) if title_tag else kw
+                        price_tag = card.select_one("div.price-block__value")
+                        price = _clean_price(price_tag.get_text(strip=True).replace("руб.","").replace(" ","") if price_tag else None)
+                        dates = card.select("div.data-block__value")
+                        published = dates[0].get_text(strip=True) if dates else None
+                        deadline = dates[1].get_text(strip=True) if len(dates) > 1 else None
+                        results.append({
+                            "external_id": eid, "source": "zakupki",
+                            "title": title, "region": None,
+                            "start_price": price, "published": published,
+                            "deadline": deadline, "url": url, "status": "active",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.error("gov search error: %s", e)
+    logger.info("zakupki search: %d тендеров", len(results))
     return results
+
+
 
 
 
