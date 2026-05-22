@@ -325,6 +325,178 @@ def _clean_price(text) -> Optional[float]:
         return None
 
 
+
+# ═══════════════════════════════════════════════════════════
+#  ПАРСЕРЫ
+# ═══════════════════════════════════════════════════════════
+
+def _clean_price(text) -> float | None:
+    if not text:
+        return None
+    try:
+        return float(
+            str(text).replace("\u00a0","").replace(" ","")
+            .replace(",",".").replace("руб.","").replace("₽","").strip()
+        )
+    except ValueError:
+        return None
+
+
+# ── rostender.info ──────────────────────────────────────────
+
+async def parse_rostender() -> list[dict]:
+    results, seen = [], set()
+    urls = [
+        "https://rostender.info/tendery-metallicheskie-othody-i-lom",
+        "https://rostender.info/category/tendery-lom-chernyh-metallov",
+        "https://rostender.info/category/tendery-vyvoz-metalloloma",
+    ]
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            for page in range(1, MAX_PAGES + 1):
+                try:
+                    page_url = url if page == 1 else f"{url}?page={page}"
+                    async with session.get(
+                        page_url, headers=HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    # Ищем все ссылки на тендеры
+                    links = soup.select("a[href*='/tender/']")
+                    if not links:
+                        break
+                    for link in links:
+                        try:
+                            href = link.get("href", "")
+                            if not href or "login" in href:
+                                continue
+                            full_url = href if href.startswith("http") else "https://rostender.info" + href
+                            number = href.rstrip("/").split("/")[-1]
+                            eid = f"rostender_{number}"
+                            if eid in seen or not number.isdigit():
+                                continue
+                            seen.add(eid)
+                            title = link.get_text(strip=True) or "Тендер на металлолом"
+                            if len(title) < 5:
+                                continue
+                            results.append({
+                                "external_id": eid, "source": "rostender",
+                                "title": title, "region": None,
+                                "start_price": None, "published": None,
+                                "deadline": None, "url": full_url, "status": "active",
+                            })
+                        except Exception:
+                            pass
+                    await asyncio.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    logger.error("rostender error: %s", e)
+                    break
+    logger.info("rostender: %d тендеров", len(results))
+    return results
+
+
+# ── synapsenet.ru ───────────────────────────────────────────
+
+async def parse_synapse() -> list[dict]:
+    results, seen = [], set()
+    base = "https://synapsenet.ru/search/category/metallolom"
+    async with aiohttp.ClientSession() as session:
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                params = {"page": page}
+                async with session.get(
+                    base, params=params, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                links = soup.select("a[href*='/zakupka/'], a[href*='/tender/']")
+                if not links:
+                    break
+                for link in links:
+                    try:
+                        href = link.get("href", "")
+                        if not href:
+                            continue
+                        full_url = href if href.startswith("http") else "https://synapsenet.ru" + href
+                        number = href.rstrip("/").split("/")[-1]
+                        eid = f"synapse_{number}"
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        title = link.get_text(strip=True) or "Тендер на металлолом"
+                        if len(title) < 5:
+                            continue
+                        results.append({
+                            "external_id": eid, "source": "synapse",
+                            "title": title, "region": None,
+                            "start_price": None, "published": None,
+                            "deadline": None, "url": full_url, "status": "active",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.error("synapse error: %s", e)
+                break
+    logger.info("synapse: %d тендеров", len(results))
+    return results
+
+
+# ── komtender.ru ─────────────────────────────────────────────
+
+async def parse_kontur() -> list[dict]:
+    results, seen = [], set()
+    base = "https://www.komtender.ru/tendery-metallicheskie-othody-i-lom"
+    async with aiohttp.ClientSession() as session:
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                page_url = base if page == 1 else f"{base}?page={page}"
+                async with session.get(
+                    page_url, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                links = soup.select("a[href*='/tender/']")
+                if not links:
+                    break
+                for link in links:
+                    try:
+                        href = link.get("href", "")
+                        if not href or "login" in href or "registration" in href:
+                            continue
+                        full_url = href if href.startswith("http") else "https://www.komtender.ru" + href
+                        number = href.rstrip("/").split("/")[-1]
+                        eid = f"komtender_{number}"
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        title = link.get_text(strip=True) or "Тендер на металлолом"
+                        if len(title) < 5:
+                            continue
+                        results.append({
+                            "external_id": eid, "source": "kontur",
+                            "title": title, "region": None,
+                            "start_price": None, "published": None,
+                            "deadline": None, "url": full_url, "status": "active",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+            except Exception as e:
+                logger.error("kontur error: %s", e)
+                break
+    logger.info("komtender: %d тендеров", len(results))
+    return results
+
 # ═══════════════════════════════════════════════════════════
 #  ПЛАНИРОВЩИК + УВЕДОМЛЕНИЯ
 # ═══════════════════════════════════════════════════════════
