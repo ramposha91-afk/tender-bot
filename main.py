@@ -574,6 +574,82 @@ async def parse_kontur() -> list[dict]:
     logger.info("komtender: %d тендеров", len(results))
     return results
 
+
+# ── komtender завершённые ────────────────────────────────────
+
+async def parse_komtender_completed() -> list[dict]:
+    """Парсит завершённые тендеры с komtender.ru."""
+    results, seen = [], set()
+    # Страницы с завершёнными тендерами — последние страницы архива
+    base = "https://www.komtender.ru/tendery-metallicheskie-othody-i-lom"
+    async with aiohttp.ClientSession() as session:
+        # Получаем последнюю страницу (там самые свежие завершённые)
+        for page_offset in range(0, 5):
+            try:
+                # Сначала узнаём последнюю страницу
+                async with session.get(
+                    base, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        break
+                    html = await resp.text()
+                soup = BeautifulSoup(html, "html.parser")
+                # Найдём номер последней страницы
+                last_page = 1
+                pagination = soup.select("a[href*='?page=']")
+                for p in pagination:
+                    href = p.get("href", "")
+                    try:
+                        num = int(href.split("page=")[-1])
+                        if num > last_page:
+                            last_page = num
+                    except:
+                        pass
+                
+                # Парсим последние страницы где завершённые тендеры
+                target_page = max(1, last_page - page_offset)
+                async with session.get(
+                    f"{base}?page={target_page}", headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                ) as resp2:
+                    if resp2.status != 200:
+                        break
+                    html2 = await resp2.text()
+                soup2 = BeautifulSoup(html2, "html.parser")
+                links = soup2.select("a[href*='/tender/']")
+                if not links:
+                    break
+                for link in links:
+                    try:
+                        href = link.get("href", "")
+                        if not href or "login" in href or "registration" in href:
+                            continue
+                        full_url = href if href.startswith("http") else "https://www.komtender.ru" + href
+                        number = href.rstrip("/").split("/")[-1]
+                        eid = f"komtender_done_{number}"
+                        if eid in seen:
+                            continue
+                        seen.add(eid)
+                        title = link.get_text(strip=True) or "Завершённый тендер"
+                        if len(title) < 5:
+                            continue
+                        results.append({
+                            "external_id": eid, "source": "kontur",
+                            "title": title, "region": None,
+                            "start_price": None, "published": None,
+                            "deadline": None, "url": full_url, "status": "completed",
+                        })
+                    except Exception:
+                        pass
+                await asyncio.sleep(REQUEST_DELAY)
+                break  # Достаточно одного прохода
+            except Exception as e:
+                logger.error("komtender completed error: %s", e)
+                break
+    logger.info("komtender завершённые: %d тендеров", len(results))
+    return results
+
 # ═══════════════════════════════════════════════════════════
 #  ПЛАНИРОВЩИК + УВЕДОМЛЕНИЯ
 # ═══════════════════════════════════════════════════════════
@@ -581,7 +657,7 @@ async def parse_kontur() -> list[dict]:
 async def run_all_parsers(bot: Bot):
     logger.info("=== Запуск парсеров: %s ===", datetime.now().strftime("%d.%m.%Y %H:%M"))
     all_tenders = []
-    for parser in [parse_rostender, parse_synapse, parse_kontur]:
+    for parser in [parse_rostender, parse_synapse, parse_kontur, parse_komtender_completed]:
         try:
             all_tenders.extend(await parser())
         except Exception as e:
