@@ -49,6 +49,10 @@ SOURCE_LABELS = {
     "kontur":    "Контур.Закупки",
 }
 
+# Synapse credentials (set via environment variables)
+SYNAPSE_LOGIN = os.getenv("SYNAPSE_LOGIN", "")
+SYNAPSE_PASS = os.getenv("SYNAPSE_PASS", "")
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -398,28 +402,48 @@ async def parse_rostender() -> list[dict]:
     return results
 
 
-# ── synapsenet.ru ───────────────────────────────────────────
+# ── synapsenet.ru (с авторизацией) ─────────────────────────
 
 async def parse_synapse() -> list[dict]:
     results, seen = [], set()
-    base = "https://synapsenet.ru/search/category/metallolom"
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar()) as session:
+        # Авторизация
+        if SYNAPSE_LOGIN and SYNAPSE_PASS:
+            try:
+                login_data = {"email": SYNAPSE_LOGIN, "password": SYNAPSE_PASS}
+                await session.post(
+                    "https://synapsenet.ru/login",
+                    data=login_data, headers=HEADERS,
+                    timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                )
+                logger.info("Synapse: авторизация выполнена")
+            except Exception as e:
+                logger.error("Synapse login error: %s", e)
+
+        # Парсинг активных тендеров
         for page in range(1, MAX_PAGES + 1):
             try:
                 params = {"page": page}
                 async with session.get(
-                    base, params=params, headers=HEADERS,
+                    "https://synapsenet.ru/search/category/metallolom",
+                    params=params, headers=HEADERS,
                     timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
                 ) as resp:
                     if resp.status != 200:
                         break
                     html = await resp.text()
                 soup = BeautifulSoup(html, "html.parser")
-                links = soup.select("a[href*='/zakupka/'], a[href*='/tender/']")
-                if not links:
+                # Ищем карточки тендеров
+                cards = soup.select("div.tender-card, div.search-result-item, tr.tender")
+                links = soup.select("a[href*='/zakupka/'], a[href*='/procedure/']")
+                items = cards if cards else links
+                if not items:
                     break
-                for link in links:
+                for item in items:
                     try:
+                        link = item if item.name == "a" else item.select_one("a[href]")
+                        if not link:
+                            continue
                         href = link.get("href", "")
                         if not href:
                             continue
@@ -432,11 +456,21 @@ async def parse_synapse() -> list[dict]:
                         title = link.get_text(strip=True) or "Тендер на металлолом"
                         if len(title) < 5:
                             continue
+                        # Цена
+                        price_tag = item.select_one("span.price, .nmck, .tender-price") if item.name != "a" else None
+                        price = _clean_price(price_tag.get_text(strip=True) if price_tag else None)
+                        # Регион
+                        region_tag = item.select_one("span.region, .location") if item.name != "a" else None
+                        region = region_tag.get_text(strip=True) if region_tag else None
+                        # Статус
+                        status_tag = item.select_one("span.status, .tender-status") if item.name != "a" else None
+                        status_text = status_tag.get_text(strip=True).lower() if status_tag else ""
+                        status = "completed" if any(w in status_text for w in ["завершён", "закрыт", "итоги"]) else "active"
                         results.append({
                             "external_id": eid, "source": "synapse",
-                            "title": title, "region": None,
-                            "start_price": None, "published": None,
-                            "deadline": None, "url": full_url, "status": "active",
+                            "title": title, "region": region,
+                            "start_price": price, "published": None,
+                            "deadline": None, "url": full_url, "status": status,
                         })
                     except Exception:
                         pass
@@ -444,6 +478,49 @@ async def parse_synapse() -> list[dict]:
             except Exception as e:
                 logger.error("synapse error: %s", e)
                 break
+
+        # Парсинг завершённых тендеров
+        if SYNAPSE_LOGIN and SYNAPSE_PASS:
+            for page in range(1, 3):
+                try:
+                    params = {"page": page, "phase": "finished"}
+                    async with session.get(
+                        "https://synapsenet.ru/search/category/metallolom",
+                        params=params, headers=HEADERS,
+                        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+                    ) as resp:
+                        if resp.status != 200:
+                            break
+                        html = await resp.text()
+                    soup = BeautifulSoup(html, "html.parser")
+                    links = soup.select("a[href*='/zakupka/'], a[href*='/procedure/']")
+                    for link in links:
+                        try:
+                            href = link.get("href", "")
+                            if not href:
+                                continue
+                            full_url = href if href.startswith("http") else "https://synapsenet.ru" + href
+                            number = href.rstrip("/").split("/")[-1]
+                            eid = f"synapse_done_{number}"
+                            if eid in seen:
+                                continue
+                            seen.add(eid)
+                            title = link.get_text(strip=True) or "Завершённый тендер"
+                            if len(title) < 5:
+                                continue
+                            results.append({
+                                "external_id": eid, "source": "synapse",
+                                "title": title, "region": None,
+                                "start_price": None, "published": None,
+                                "deadline": None, "url": full_url, "status": "completed",
+                            })
+                        except Exception:
+                            pass
+                    await asyncio.sleep(REQUEST_DELAY)
+                except Exception as e:
+                    logger.error("synapse completed error: %s", e)
+                    break
+
     logger.info("synapse: %d тендеров", len(results))
     return results
 
