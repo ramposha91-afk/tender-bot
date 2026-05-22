@@ -871,6 +871,11 @@ async def btn_summary(message: Message): await cmd_summary(message)
 @router.message(lambda m: m.text == "❓ Помощь")
 async def btn_help(message: Message): await cmd_start(message)
 
+@router.message(Command("parse"))
+async def cmd_parse(message: Message):
+    await message.answer("🔄 Запускаю парсинг всех площадок... Займёт 10-15 минут.", parse_mode="HTML")
+    asyncio.create_task(run_all_parsers(message.bot))
+
 @router.message(lambda m: m.text == "🔔 Уведомления вкл")
 async def btn_alerts_on(message: Message):
     await set_alerts(message.chat.id, True)
@@ -898,7 +903,7 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow", job_defaults={"misfire_grace_time": 3600})
     scheduler.add_job(
         run_all_parsers, "interval", hours=2,
         args=[bot], next_run_time=datetime.now(),
@@ -906,6 +911,8 @@ async def main():
     )
     scheduler.start()
     logger.info("Планировщик запущен")
+    # Запускаем первый парсинг сразу в фоне
+    asyncio.create_task(run_all_parsers(bot))
 
     logger.info("Бот запущен ✅")
     try:
