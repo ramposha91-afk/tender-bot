@@ -6,7 +6,7 @@ Telegram-бот мониторинга тендеров ЕИС (zakupki.gov.ru)
     pip install aiogram aiohttp aiosqlite apscheduler beautifulsoup4 --break-system-packages
 
 Запуск:
-    export BOT_TOKEN="ваш_токен"
+    export BOT_TOKEN="8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4"
     python3 main.py
 """
 
@@ -31,7 +31,7 @@ from bs4 import BeautifulSoup
 #  НАСТРОЙКИ — редактируйте здесь
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4")
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30  # интервал обновления
 
