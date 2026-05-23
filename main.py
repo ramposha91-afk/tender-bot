@@ -6,7 +6,7 @@ Telegram-бот мониторинга тендеров ЕИС (zakupki.gov.ru)
     pip install aiogram aiohttp aiosqlite apscheduler beautifulsoup4 --break-system-packages
 
 Запуск:
-    export BOT_TOKEN="8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4"
+    export BOT_TOKEN="ваш_токен"
     python3 main.py
 """
 
@@ -31,7 +31,7 @@ from bs4 import BeautifulSoup
 #  НАСТРОЙКИ — редактируйте здесь
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30  # интервал обновления
 
@@ -50,21 +50,36 @@ SEARCH_KEYWORDS: list[str] = [
 ]
 
 # Слова для фильтрации — тендер должен содержать хотя бы одно
+# Ключевые слова — тендер ДОЛЖЕН содержать хотя бы одно
 FILTER_KEYWORDS: list[str] = [
-    "лом", "металлолом", "металл", "чермет", "цветмет",
-    "алюминий", "медь", "латунь", "цинк", "никель", "свинец",
-    "стружка", "отходы металл", "вторсырье", "вторичное сырье",
-    "демонтаж металлоконструкц", "металлоконструкц",
-    "прием лома", "сдача лома", "реализация лома",
-    "лом черных", "лом цветных",
+    "металлолом", "лом черных", "лом цветных", "лом чермет",
+    "прием лома", "сдача лома", "реализация лома", "вывоз лома",
+    "закупка лома", "поставка лома", "лом алюмини",
+    "стружка алюминиев", "стружка металл",
+    "отходы черных металлов", "отходы цветных металлов",
+    "вторичное сырье металл", "демонтаж металлоконструкц",
+    "лом меди", "лом латуни", "лом цинка", "лом свинца",
+    "лом нержавеющ", "лом чугун",
+]
+
+# Слова которые ЗАПРЕЩАЮТ включение (ложные срабатывания)
+EXCLUDE_KEYWORDS: list[str] = [
+    "молоко", "молочн", "мясо", "рыб", "продукт питани",
+    "медицин", "лекарств", "одежда", "обувь", "мебель",
+    "бумага", "картон", "пластик", "стекло", "дерево",
+    "алюминиевая посуда", "алюминиевая фляг", "алюминиевый профил",
 ]
 
 
 def is_metal_tender(title: str) -> bool:
-    """Проверить что тендер связан с металлом/ломом."""
+    """Проверить что тендер про металлолом/лом — строгая фильтрация."""
     if not title:
         return False
     title_lower = title.lower()
+    # Если есть запрещённое слово — отклоняем
+    if any(ex.lower() in title_lower for ex in EXCLUDE_KEYWORDS):
+        return False
+    # Должно быть хотя бы одно ключевое слово
     return any(kw.lower() in title_lower for kw in FILTER_KEYWORDS)
 
 
@@ -162,6 +177,17 @@ async def upsert_active_tender(t: dict) -> bool:
     # Фильтруем нерелевантные тендеры
     if not is_metal_tender(t.get("title", "")):
         return False
+    # Фильтруем старые тендеры (старше 2 лет)
+    deadline = t.get("deadline", "")
+    if deadline:
+        for fmt in ("%d.%m.%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                dt = datetime.strptime(deadline[:10], fmt[:len(deadline[:10])])
+                if dt.year < 2023:
+                    return False
+                break
+            except:
+                pass
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -483,16 +509,22 @@ def parse_tender_card(card) -> Optional[dict]:
 
         # Регион заказчика
         region = None
-        for block in card.select("div.registry-entry__body-href, span.region"):
+        # Ищем в блоках с регионом
+        for block in card.select("div.registry-entry__body-href"):
             text = block.get_text(" ", strip=True)
-            if "Регион" in text or "субъект" in text.lower():
-                region = text.split(":")[-1].strip()
-                break
+            if "Регион" in text:
+                parts = text.split(":")
+                if len(parts) > 1:
+                    region = parts[-1].strip()[:100]
+                    break
+        # Ищем в адресе заказчика
         if not region:
-            # Пробуем найти в адресе заказчика
-            addr = card.select_one("div.registry-entry__body-value span")
-            if addr:
-                region = addr.get_text(strip=True)
+            for tag in card.select("span.section__info, div.registry-entry__body-value"):
+                text = tag.get_text(strip=True)
+                # Типичные названия регионов содержат "область", "край", "республика"
+                if any(w in text.lower() for w in ["область", "край", "республика", "округ", "москва", "петербург"]):
+                    region = text[:100]
+                    break
 
         # Сроки подачи
         dates = card.select("div.data-block__value, span.date-value")
