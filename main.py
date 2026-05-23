@@ -31,7 +31,7 @@ from bs4 import BeautifulSoup
 #  НАСТРОЙКИ — редактируйте здесь
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30  # интервал обновления
 
@@ -48,6 +48,25 @@ SEARCH_KEYWORDS: list[str] = [
     "отходы металлов",
     "демонтаж металлоконструкций",
 ]
+
+# Слова для фильтрации — тендер должен содержать хотя бы одно
+FILTER_KEYWORDS: list[str] = [
+    "лом", "металлолом", "металл", "чермет", "цветмет",
+    "алюминий", "медь", "латунь", "цинк", "никель", "свинец",
+    "стружка", "отходы металл", "вторсырье", "вторичное сырье",
+    "демонтаж металлоконструкц", "металлоконструкц",
+    "прием лома", "сдача лома", "реализация лома",
+    "лом черных", "лом цветных",
+]
+
+
+def is_metal_tender(title: str) -> bool:
+    """Проверить что тендер связан с металлом/ломом."""
+    if not title:
+        return False
+    title_lower = title.lower()
+    return any(kw.lower() in title_lower for kw in FILTER_KEYWORDS)
+
 
 # HTTP настройки
 REQUEST_TIMEOUT: int = 30
@@ -101,6 +120,7 @@ async def init_db():
                 tender_number TEXT UNIQUE,
                 title        TEXT,
                 region       TEXT,
+                keyword      TEXT,
                 price        REAL,
                 deadline     TEXT,
                 status       TEXT,
@@ -139,6 +159,9 @@ async def init_db():
 
 async def upsert_active_tender(t: dict) -> bool:
     """Добавить/обновить активный тендер. Возвращает True если новый."""
+    # Фильтруем нерелевантные тендеры
+    if not is_metal_tender(t.get("title", "")):
+        return False
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -160,11 +183,11 @@ async def upsert_active_tender(t: dict) -> bool:
         else:
             await db.execute(
                 """INSERT INTO active_tenders
-                   (tender_number, title, region, price, deadline, status, url, published_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                   (tender_number, title, region, keyword, price, deadline, status, url, published_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
                 (t["tender_number"], t.get("title"), t.get("region"),
-                 t.get("price"), t.get("deadline"), t.get("status"),
-                 t.get("url"), now, now)
+                 t.get("keyword"), t.get("price"), t.get("deadline"),
+                 t.get("status"), t.get("url"), now, now)
             )
             await db.commit()
             return True
@@ -243,14 +266,24 @@ async def get_active_summary() -> dict:
         db.row_factory = aiosqlite.Row
         c1 = await db.execute("SELECT COUNT(*) as cnt, SUM(price) as total FROM active_tenders")
         r1 = dict(await c1.fetchone())
+        # По регионам
         c2 = await db.execute(
             """SELECT region, COUNT(*) as cnt, SUM(price) as total
                FROM active_tenders
-               WHERE region IS NOT NULL AND region != ''
+               WHERE region IS NOT NULL AND region != '' AND length(region) > 5
                GROUP BY region ORDER BY total DESC LIMIT 10"""
         )
         regions = [dict(r) for r in await c2.fetchall()]
-        return {"count": r1["cnt"] or 0, "total": r1["total"] or 0, "regions": regions}
+        # По ключевым словам
+        c3 = await db.execute(
+            """SELECT keyword, COUNT(*) as cnt, SUM(price) as total
+               FROM active_tenders
+               WHERE keyword IS NOT NULL AND keyword != ''
+               GROUP BY keyword ORDER BY cnt DESC LIMIT 10"""
+        )
+        keywords = [dict(r) for r in await c3.fetchall()]
+        return {"count": r1["cnt"] or 0, "total": r1["total"] or 0,
+                "regions": regions, "keywords": keywords}
 
 
 async def get_finished_summary() -> dict:
@@ -339,11 +372,18 @@ def format_active_summary(data: dict) -> str:
         f"Всего: <b>{data['count']}</b>",
         f"Общая сумма: <b>{fmt_price(data['total'])}</b>",
     ]
-    if data["regions"]:
+    if data.get("regions"):
         lines.append("")
+        lines.append("📍 <b>По регионам:</b>")
         for r in data["regions"]:
             name = r["region"] or "Не указан"
-            lines.append(f"📍 {name} — {r['cnt']} тендер(а) / {fmt_price(r['total'])}")
+            lines.append(f"  {name} — {r['cnt']} тендер(а) / {fmt_price(r['total'])}")
+    if data.get("keywords"):
+        lines.append("")
+        lines.append("🔑 <b>По ключевым словам:</b>")
+        for k in data["keywords"]:
+            name = k["keyword"] or "—"
+            lines.append(f"  {name} — {k['cnt']} тендер(а) / {fmt_price(k['total'])}")
     return "\n".join(lines)
 
 
@@ -411,7 +451,6 @@ def parse_tender_card(card) -> Optional[dict]:
             return None
 
         href = num_tag.get("href", "")
-        url = f"https://zakupki.gov.ru{href}" if href.startswith("/") else href
 
         # Извлекаем номер из ссылки или текста
         number = ""
@@ -421,6 +460,9 @@ def parse_tender_card(card) -> Optional[dict]:
             number = re.sub(r"[^\d]", "", num_tag.get_text(strip=True))
         if not number:
             return None
+
+        # Формируем правильную ссылку на тендер
+        url = f"https://zakupki.gov.ru/epz/order/notice/ea44/view/common-info.html?regNumber={number}"
 
         # Название тендера
         title_tag = card.select_one(
