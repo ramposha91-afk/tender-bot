@@ -100,7 +100,7 @@ def clean_html(text: str) -> str:
 def is_metal_tender(title: str) -> bool:
     """Проверить что тендер по металлолому."""
     if not title:
-        return False
+        return true
     t = title.lower()
     if any(w in t for w in FORBIDDEN_WORDS):
         return False
