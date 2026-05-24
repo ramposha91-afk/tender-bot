@@ -25,7 +25,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAFQwAIBxDw8f0T7egIE4Lo2_P6zoEsbyQg")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAH6Lx0qG8Fp0LfeQAp8nw3GChXDXGHNGfw")
 TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "2cface68d403d496ac0ac2c8d27d98a25654472d3bf532ca39e56045a57c2d37bf7833c46abfce40d47f9fd81d97a1f9ce90b773dc5e0e6ff39d0ec942ec402c")
 
 DB_PATH: str = "tenders.db"
