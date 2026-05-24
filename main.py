@@ -25,8 +25,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAFQwAIBxDw8f0T7egIE4Lo2_P6zoEsbyQg")
-TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "85ee03665e6fb1379da6cb7b9a43ac6acee833e46e9e11ac17e6950164bf20335795a3acd8c4b7540b606cab6837136a7b4fa191f73152ed44bb37eb0a440c83")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "ВСТАВЬТЕ_TENDERPLAN_TOKEN")
 
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30
@@ -99,9 +99,10 @@ def is_metal_tender(title: str) -> bool:
     if not title:
         return False
     t = title.lower()
+    # Только убираем явно нерелевантные
     if any(w in t for w in FORBIDDEN_WORDS):
         return False
-    return any(w in t for w in REQUIRED_WORDS)
+    return True  # Доверяем поиску Tenderplan по ключевым словам
 
 
 # ═══════════════════════════════════════════════════════════
@@ -392,7 +393,6 @@ async def tp_search(session: aiohttp.ClientSession,
         "text": keyword,
         "page": page,
         "count": count,
-        "statusList": [1, 2],  # 1=активные, 2=на рассмотрении
     }
     for attempt in range(1, MAX_RETRIES + 1):
         try:
