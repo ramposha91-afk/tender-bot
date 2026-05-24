@@ -1,20 +1,15 @@
 """
-Telegram-бот мониторинга тендеров ЕИС (zakupki.gov.ru)
-Один файл — полный MVP.
-
-Установка:
-    pip install aiogram aiohttp aiosqlite apscheduler beautifulsoup4 --break-system-packages
-
-Запуск:
-    export BOT_TOKEN="8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4"
-    python3 main.py
+Telegram-бот мониторинга тендеров по металлолому
+Источник данных: Tenderplan API
+Запуск: python3 main.py
+Переменные окружения: BOT_TOKEN, TENDERPLAN_TOKEN
 """
 
 import asyncio
+import html
 import logging
 import os
 import re
-import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -25,87 +20,52 @@ from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from bs4 import BeautifulSoup
 
 # ═══════════════════════════════════════════════════════════
-#  НАСТРОЙКИ — редактируйте здесь
+#  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAEWD7QiXn2SUfH0EfZMTL4NoJz00keNcO4")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "ВСТАВЬТЕ_TENDERPLAN_TOKEN")
+
 DB_PATH: str = "tenders.db"
-UPDATE_INTERVAL_MINUTES: int = 30  # интервал обновления
+UPDATE_INTERVAL_MINUTES: int = 30
 
-# Ключевые слова поиска — легко редактировать
+# Ключевые слова для поиска — редактируйте здесь
 SEARCH_KEYWORDS: list[str] = [
-    "лом",
     "металлолом",
-    "алюминий",
-    "лом алюминия",
-    "стружка алюминиевая",
-    "медь",
-    "латунь",
+    "лом черных металлов",
     "лом цветных металлов",
-    "отходы металлов",
+    "лом алюминия",
+    "лом меди",
+    "лом латуни",
+    "прием лома",
+    "реализация лома",
+    "стружка металлическая",
+    "отходы черных металлов",
+    "отходы цветных металлов",
     "демонтаж металлоконструкций",
 ]
 
-# Слова для фильтрации — тендер должен содержать хотя бы одно
-# Ключевые слова — тендер ДОЛЖЕН содержать хотя бы одно
-FILTER_KEYWORDS: list[str] = [
-    "металлолом", "лом черных", "лом цветных", "лом чермет",
-    "прием лома", "сдача лома", "реализация лома", "вывоз лома",
-    "закупка лома", "поставка лома", "лом алюмини",
-    "стружка алюминиев", "стружка металл",
-    "отходы черных металлов", "отходы цветных металлов",
-    "вторичное сырье металл", "демонтаж металлоконструкц",
-    "лом меди", "лом латуни", "лом цинка", "лом свинца",
-    "лом нержавеющ", "лом чугун",
+# Обязательные слова — хотя бы одно должно быть в названии
+REQUIRED_WORDS: list[str] = [
+    "лом", "металлолом", "металлолом", "чермет", "цветмет",
+    "стружка металл", "отходы металл", "металлоконструкц",
 ]
 
-# Слова которые ЗАПРЕЩАЮТ включение (ложные срабатывания)
-EXCLUDE_KEYWORDS: list[str] = [
-    "молоко", "молочн", "мясо", "рыб", "продукт питани",
-    "медицин", "лекарств", "одежда", "обувь", "мебель",
-    "бумага", "картон", "пластик", "стекло", "дерево",
-    "алюминиевая посуда", "алюминиевая фляг", "алюминиевый профил",
+# Запрещённые слова — тендер отклоняется
+FORBIDDEN_WORDS: list[str] = [
+    "молоко", "молочн", "мясо", "рыба", "продукт питани",
+    "медицинск", "лекарств", "фармацевт", "посуда",
+    "квартир", "жилое", "недвижим", "земельный участок",
+    "автомобил", "транспортн", "канцелярск",
 ]
 
-
-def is_metal_tender(title: str) -> bool:
-    """Проверить что тендер про металлолом/лом — строгая фильтрация."""
-    if not title:
-        return False
-    title_lower = title.lower()
-    # Если есть запрещённое слово — отклоняем
-    if any(ex.lower() in title_lower for ex in EXCLUDE_KEYWORDS):
-        return False
-    # Должно быть хотя бы одно ключевое слово
-    return any(kw.lower() in title_lower for kw in FILTER_KEYWORDS)
-
-
-# HTTP настройки
+# HTTP
 REQUEST_TIMEOUT: int = 30
-REQUEST_DELAY: float = 3.0
+REQUEST_DELAY: float = 1.0
 MAX_RETRIES: int = 3
-MAX_PAGES: int = 5
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
-    "Referer": "https://zakupki.gov.ru/",
-}
+TENDERPLAN_API: str = "https://tenderplan.ru/api"
 
 # ═══════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ
@@ -122,39 +82,60 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════
+#  ФИЛЬТРАЦИЯ
+# ═══════════════════════════════════════════════════════════
+
+def clean_html(text: str) -> str:
+    """Убрать HTML теги из названия."""
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return " ".join(text.split()).strip()
+
+
+def is_metal_tender(title: str) -> bool:
+    """Проверить что тендер по металлолому."""
+    if not title:
+        return False
+    t = title.lower()
+    if any(w in t for w in FORBIDDEN_WORDS):
+        return False
+    return any(w in t for w in REQUIRED_WORDS)
+
+
+# ═══════════════════════════════════════════════════════════
 #  БАЗА ДАННЫХ
 # ═══════════════════════════════════════════════════════════
 
 async def init_db():
-    """Инициализация базы данных и создание таблиц."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.executescript("""
             CREATE TABLE IF NOT EXISTS active_tenders (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                tender_number TEXT UNIQUE,
-                title        TEXT,
-                region       TEXT,
-                keyword      TEXT,
-                price        REAL,
-                deadline     TEXT,
-                status       TEXT,
-                url          TEXT,
-                published_at TEXT,
-                updated_at   TEXT
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                tender_id     TEXT UNIQUE,
+                title         TEXT,
+                region        TEXT,
+                keyword       TEXT,
+                price         REAL,
+                deadline      TEXT,
+                status        TEXT,
+                url           TEXT,
+                published_at  TEXT,
+                updated_at    TEXT
             );
 
             CREATE TABLE IF NOT EXISTS finished_tenders (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                tender_number TEXT UNIQUE,
-                title        TEXT,
-                region       TEXT,
-                start_price  REAL,
-                final_price  REAL,
-                winner       TEXT,
-                finished_at  TEXT,
-                status       TEXT,
-                url          TEXT
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                tender_id     TEXT UNIQUE,
+                title         TEXT,
+                region        TEXT,
+                start_price   REAL,
+                final_price   REAL,
+                winner        TEXT,
+                finished_at   TEXT,
+                url           TEXT
             );
 
             CREATE TABLE IF NOT EXISTS subscribers (
@@ -163,100 +144,67 @@ async def init_db():
                 joined_at TEXT DEFAULT (datetime('now'))
             );
 
-            CREATE INDEX IF NOT EXISTS idx_active_region   ON active_tenders(region);
-            CREATE INDEX IF NOT EXISTS idx_active_price    ON active_tenders(price);
-            CREATE INDEX IF NOT EXISTS idx_active_updated  ON active_tenders(updated_at);
-            CREATE INDEX IF NOT EXISTS idx_finished_region ON finished_tenders(region);
+            CREATE INDEX IF NOT EXISTS idx_active_updated ON active_tenders(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_active_region  ON active_tenders(region);
+            CREATE INDEX IF NOT EXISTS idx_active_keyword ON active_tenders(keyword);
         """)
         await db.commit()
-    logger.info("БД инициализирована: %s", DB_PATH)
+    logger.info("БД готова: %s", DB_PATH)
 
 
-async def upsert_active_tender(t: dict) -> bool:
-    """Добавить/обновить активный тендер. Возвращает True если новый."""
-    # Фильтруем нерелевантные тендеры
+async def upsert_active(t: dict) -> bool:
+    """Сохранить активный тендер. True = новый."""
     if not is_metal_tender(t.get("title", "")):
         return False
-    # Фильтруем старые тендеры (старше 2 лет)
-    deadline = t.get("deadline", "")
-    if deadline:
-        for fmt in ("%d.%m.%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
-            try:
-                dt = datetime.strptime(deadline[:10], fmt[:len(deadline[:10])])
-                if dt.year < 2023:
-                    return False
-                break
-            except:
-                pass
     now = datetime.utcnow().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id, status FROM active_tenders WHERE tender_number=?",
-            (t["tender_number"],)
+            "SELECT id FROM active_tenders WHERE tender_id=?", (t["tender_id"],)
         )
-        row = await cur.fetchone()
-        if row:
+        if await cur.fetchone():
             await db.execute(
-                """UPDATE active_tenders
-                   SET title=?, region=?, price=?, deadline=?, status=?,
-                       url=?, updated_at=?
-                   WHERE id=?""",
+                "UPDATE active_tenders SET title=?,region=?,price=?,deadline=?,status=?,url=?,updated_at=? WHERE tender_id=?",
                 (t.get("title"), t.get("region"), t.get("price"),
-                 t.get("deadline"), t.get("status"), t.get("url"), now, row[0])
+                 t.get("deadline"), t.get("status"), t.get("url"), now, t["tender_id"])
             )
             await db.commit()
             return False
-        else:
-            await db.execute(
-                """INSERT INTO active_tenders
-                   (tender_number, title, region, keyword, price, deadline, status, url, published_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (t["tender_number"], t.get("title"), t.get("region"),
-                 t.get("keyword"), t.get("price"), t.get("deadline"),
-                 t.get("status"), t.get("url"), now, now)
-            )
-            await db.commit()
-            return True
+        await db.execute(
+            """INSERT INTO active_tenders
+               (tender_id,title,region,keyword,price,deadline,status,url,published_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (t["tender_id"], t.get("title"), t.get("region"), t.get("keyword"),
+             t.get("price"), t.get("deadline"), t.get("status"),
+             t.get("url"), now, now)
+        )
+        await db.commit()
+        return True
 
 
-async def move_to_finished(tender_number: str, final_price: Optional[float],
-                           winner: Optional[str], finished_at: Optional[str]):
-    """Перенести тендер из активных в завершённые."""
+async def move_to_finished(tender_id: str, final_price: Optional[float],
+                            winner: Optional[str], finished_at: Optional[str]):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT * FROM active_tenders WHERE tender_number=?", (tender_number,)
+            "SELECT * FROM active_tenders WHERE tender_id=?", (tender_id,)
         )
         row = await cur.fetchone()
         if not row:
             return
         cols = [d[0] for d in cur.description]
         t = dict(zip(cols, row))
-
-        # Проверяем нет ли уже в finished
-        cur2 = await db.execute(
-            "SELECT 1 FROM finished_tenders WHERE tender_number=?", (tender_number,)
-        )
-        if await cur2.fetchone():
-            await db.execute("DELETE FROM active_tenders WHERE tender_number=?", (tender_number,))
-            await db.commit()
-            return
-
         await db.execute(
             """INSERT OR REPLACE INTO finished_tenders
-               (tender_number, title, region, start_price, final_price,
-                winner, finished_at, status, url)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            (tender_number, t.get("title"), t.get("region"),
-             t.get("price"), final_price, winner,
-             finished_at or datetime.utcnow().isoformat(),
-             "Завершён", t.get("url"))
+               (tender_id,title,region,start_price,final_price,winner,finished_at,url)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (tender_id, t.get("title"), t.get("region"), t.get("price"),
+             final_price, winner, finished_at or now, t.get("url"))
         )
-        await db.execute("DELETE FROM active_tenders WHERE tender_number=?", (tender_number,))
+        await db.execute("DELETE FROM active_tenders WHERE tender_id=?", (tender_id,))
         await db.commit()
-        logger.info("Тендер %s перенесён в завершённые", tender_number)
+        logger.info("Тендер %s → завершённые", tender_id)
 
 
-async def get_active_tenders(limit: int = 20, region: Optional[str] = None) -> list[dict]:
+async def get_active(limit: int = 15, region: Optional[str] = None) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if region:
@@ -271,7 +219,7 @@ async def get_active_tenders(limit: int = 20, region: Optional[str] = None) -> l
         return [dict(r) for r in await cur.fetchall()]
 
 
-async def get_finished_tenders(limit: int = 20, region: Optional[str] = None) -> list[dict]:
+async def get_finished(limit: int = 15, region: Optional[str] = None) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         if region:
@@ -287,24 +235,19 @@ async def get_finished_tenders(limit: int = 20, region: Optional[str] = None) ->
 
 
 async def get_active_summary() -> dict:
-    """Сводка по активным тендерам."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         c1 = await db.execute("SELECT COUNT(*) as cnt, SUM(price) as total FROM active_tenders")
         r1 = dict(await c1.fetchone())
-        # По регионам
         c2 = await db.execute(
             """SELECT region, COUNT(*) as cnt, SUM(price) as total
-               FROM active_tenders
-               WHERE region IS NOT NULL AND region != '' AND length(region) > 5
+               FROM active_tenders WHERE region IS NOT NULL AND length(region) > 3
                GROUP BY region ORDER BY total DESC LIMIT 10"""
         )
         regions = [dict(r) for r in await c2.fetchall()]
-        # По ключевым словам
         c3 = await db.execute(
             """SELECT keyword, COUNT(*) as cnt, SUM(price) as total
-               FROM active_tenders
-               WHERE keyword IS NOT NULL AND keyword != ''
+               FROM active_tenders WHERE keyword IS NOT NULL
                GROUP BY keyword ORDER BY cnt DESC LIMIT 10"""
         )
         keywords = [dict(r) for r in await c3.fetchall()]
@@ -313,29 +256,25 @@ async def get_active_summary() -> dict:
 
 
 async def get_finished_summary() -> dict:
-    """Сводка по завершённым тендерам."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         c1 = await db.execute(
-            "SELECT COUNT(*) as cnt, SUM(start_price) as total, AVG(final_price) as avg_final FROM finished_tenders"
+            "SELECT COUNT(*) as cnt, SUM(start_price) as total, AVG(final_price) as avg FROM finished_tenders"
         )
         r1 = dict(await c1.fetchone())
         c2 = await db.execute(
             """SELECT region, COUNT(*) as cnt, SUM(start_price) as total
-               FROM finished_tenders
-               WHERE region IS NOT NULL AND region != ''
+               FROM finished_tenders WHERE region IS NOT NULL
                GROUP BY region ORDER BY cnt DESC LIMIT 10"""
         )
         regions = [dict(r) for r in await c2.fetchall()]
         return {"count": r1["cnt"] or 0, "total": r1["total"] or 0,
-                "avg_final": r1["avg_final"] or 0, "regions": regions}
+                "avg": r1["avg"] or 0, "regions": regions}
 
 
 async def subscribe(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)", (chat_id,)
-        )
+        await db.execute("INSERT OR IGNORE INTO subscribers (chat_id) VALUES (?)", (chat_id,))
         await db.commit()
 
 
@@ -350,7 +289,6 @@ async def get_subscribers() -> list[int]:
 # ═══════════════════════════════════════════════════════════
 
 def fmt_price(price: Optional[float]) -> str:
-    """Форматировать цену."""
     if price is None:
         return "не указана"
     if price >= 1_000_000_000:
@@ -362,13 +300,23 @@ def fmt_price(price: Optional[float]) -> str:
     return f"{price:.2f} ₽"
 
 
+def fmt_ts(ts_ms: Optional[int]) -> Optional[str]:
+    """Timestamp в миллисекундах → строка даты."""
+    if not ts_ms:
+        return None
+    try:
+        return datetime.fromtimestamp(ts_ms / 1000).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return None
+
+
 def format_active_card(t: dict) -> str:
     return (
         f"🏭 <b>Название:</b> {t.get('title') or '—'}\n"
         f"📍 <b>Регион:</b> {t.get('region') or 'не указан'}\n"
         f"💰 <b>Начальная цена:</b> {fmt_price(t.get('price'))}\n"
         f"⏰ <b>Срок подачи:</b> {t.get('deadline') or 'не указан'}\n"
-        f"🏛 <b>Площадка:</b> ЕИС\n"
+        f"🏛 <b>Площадка:</b> Tenderplan\n"
         f"📌 <b>Статус:</b> {t.get('status') or 'Активен'}\n"
         f"🔗 <a href=\"{t.get('url', '')}\">Открыть тендер</a>"
     )
@@ -376,15 +324,17 @@ def format_active_card(t: dict) -> str:
 
 def format_finished_card(t: dict) -> str:
     savings = ""
-    if t.get("start_price") and t.get("final_price") and t["start_price"] > 0:
-        pct = (1 - t["final_price"] / t["start_price"]) * 100
+    sp = t.get("start_price")
+    fp = t.get("final_price")
+    if sp and fp and sp > 0:
+        pct = (1 - fp / sp) * 100
         savings = f"\n📉 <b>Экономия:</b> {pct:.1f}%"
     return (
         f"🏁 <b>Тендер завершён</b>\n\n"
         f"🏭 <b>Название:</b> {t.get('title') or '—'}\n"
         f"📍 <b>Регион:</b> {t.get('region') or 'не указан'}\n"
-        f"💰 <b>Начальная цена:</b> {fmt_price(t.get('start_price'))}\n"
-        f"🏁 <b>Итоговая цена:</b> {fmt_price(t.get('final_price'))}"
+        f"💰 <b>Начальная цена:</b> {fmt_price(sp)}\n"
+        f"🏁 <b>Итоговая цена:</b> {fmt_price(fp)}"
         f"{savings}\n"
         f"🥇 <b>Победитель:</b> {t.get('winner') or 'не указан'}\n"
         f"📌 <b>Статус:</b> Завершён\n"
@@ -394,261 +344,150 @@ def format_finished_card(t: dict) -> str:
 
 def format_active_summary(data: dict) -> str:
     lines = [
-        "📊 <b>Новые тендеры</b>\n",
+        "📊 <b>Сводка — Активные тендеры</b>\n",
         f"Всего: <b>{data['count']}</b>",
         f"Общая сумма: <b>{fmt_price(data['total'])}</b>",
     ]
     if data.get("regions"):
-        lines.append("")
-        lines.append("📍 <b>По регионам:</b>")
+        lines += ["", "📍 <b>По регионам:</b>"]
         for r in data["regions"]:
-            name = r["region"] or "Не указан"
-            lines.append(f"  {name} — {r['cnt']} тендер(а) / {fmt_price(r['total'])}")
+            lines.append(f"  {r['region']} — {r['cnt']} тенд. / {fmt_price(r['total'])}")
     if data.get("keywords"):
-        lines.append("")
-        lines.append("🔑 <b>По ключевым словам:</b>")
+        lines += ["", "🔑 <b>По ключевым словам:</b>"]
         for k in data["keywords"]:
-            name = k["keyword"] or "—"
-            lines.append(f"  {name} — {k['cnt']} тендер(а) / {fmt_price(k['total'])}")
+            lines.append(f"  {k['keyword']} — {k['cnt']} тенд. / {fmt_price(k['total'])}")
     return "\n".join(lines)
 
 
 def format_finished_summary(data: dict) -> str:
     lines = [
-        "📊 <b>Завершённые тендеры</b>\n",
+        "📊 <b>Сводка — Завершённые тендеры</b>\n",
         f"Всего: <b>{data['count']}</b>",
         f"Общая сумма НМЦ: <b>{fmt_price(data['total'])}</b>",
-        f"Средняя итоговая цена: <b>{fmt_price(data['avg_final'])}</b>",
+        f"Средняя итоговая цена: <b>{fmt_price(data['avg'])}</b>",
     ]
-    if data["regions"]:
-        lines.append("")
+    if data.get("regions"):
+        lines += ["", "📍 <b>По регионам:</b>"]
         for r in data["regions"]:
-            name = r["region"] or "Не указан"
-            lines.append(f"📍 {name} — {r['cnt']} тендер(а) / {fmt_price(r['total'])}")
+            lines.append(f"  {r['region']} — {r['cnt']} тенд. / {fmt_price(r['total'])}")
     return "\n".join(lines)
 
 
 # ═══════════════════════════════════════════════════════════
-#  ПАРСЕР ЕИС
+#  TENDERPLAN API
 # ═══════════════════════════════════════════════════════════
 
-def _parse_price(text: Optional[str]) -> Optional[float]:
-    """Извлечь число из строки с ценой."""
-    if not text:
-        return None
-    cleaned = re.sub(r"[^\d,.]", "", text.replace("\u00a0", "")).replace(",", ".")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
+def get_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {TENDERPLAN_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+    }
 
 
-async def fetch_with_retry(session: aiohttp.ClientSession, url: str,
-                            params: dict = None) -> Optional[str]:
-    """HTTP GET с повторными попытками."""
+async def tp_search(session: aiohttp.ClientSession,
+                    keyword: str, page: int = 1, count: int = 50) -> list[dict]:
+    """Поиск тендеров через Tenderplan API."""
+    payload = {
+        "text": keyword,
+        "page": page,
+        "count": count,
+        "statusList": [1, 2],  # 1=активные, 2=на рассмотрении
+    }
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            async with session.get(
-                url, params=params, headers=HEADERS,
+            async with session.post(
+                f"{TENDERPLAN_API}/search/list",
+                json=payload,
+                headers=get_headers(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
-                allow_redirects=True,
             ) as resp:
                 if resp.status == 200:
-                    return await resp.text()
-                logger.warning("HTTP %s для %s (попытка %d)", resp.status, url, attempt)
+                    data = await resp.json()
+                    return data.get("tenders", [])
+                elif resp.status == 429:
+                    logger.warning("Rate limit, ждём 10 сек")
+                    await asyncio.sleep(10)
+                else:
+                    logger.warning("Tenderplan search %s: HTTP %s", keyword, resp.status)
+                    return []
         except asyncio.TimeoutError:
-            logger.warning("Таймаут %s (попытка %d)", url, attempt)
+            logger.warning("Таймаут Tenderplan (попытка %d)", attempt)
         except Exception as e:
-            logger.warning("Ошибка %s (попытка %d): %s", url, attempt, e)
+            logger.warning("Ошибка Tenderplan: %s", e)
         if attempt < MAX_RETRIES:
             await asyncio.sleep(2 ** attempt)
+    return []
+
+
+async def tp_get_tender(session: aiohttp.ClientSession, tender_id: str) -> Optional[dict]:
+    """Получить полную информацию о тендере включая контракты."""
+    try:
+        async with session.get(
+            f"{TENDERPLAN_API}/tenders/v2/fullinfo",
+            params={"id": tender_id},
+            headers=get_headers(),
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception as e:
+        logger.debug("tp_get_tender error: %s", e)
     return None
 
 
-def parse_tender_card(card) -> Optional[dict]:
-    """Разобрать карточку тендера из HTML ЕИС."""
+async def tp_get_contracts(session: aiohttp.ClientSession, tender_id: str) -> list[dict]:
+    """Получить контракты тендера (победитель и итоговая цена)."""
     try:
-        # Номер закупки
-        num_tag = card.select_one(
-            "div.registry-entry__header-mid__number a, "
-            "a[href*='regNumber='], span.tender-number"
-        )
-        if not num_tag:
-            return None
-
-        href = num_tag.get("href", "")
-
-        # Извлекаем номер из ссылки или текста
-        number = ""
-        if "regNumber=" in href:
-            number = href.split("regNumber=")[-1].split("&")[0]
-        if not number:
-            number = re.sub(r"[^\d]", "", num_tag.get_text(strip=True))
-        if not number:
-            return None
-
-        # Формируем правильную ссылку на тендер
-        url = f"https://zakupki.gov.ru/epz/order/notice/ea44/view/common-info.html?regNumber={number}"
-
-        # Название тендера
-        title_tag = card.select_one(
-            "div.registry-entry__body-value, "
-            "a.registry-entry__body-title, "
-            "span.tender-title"
-        )
-        title = title_tag.get_text(strip=True) if title_tag else ""
-
-        # Цена (НМЦК)
-        price_tag = card.select_one(
-            "div.price-block__value, "
-            "span.price, "
-            "div.registry-entry__body-value.price"
-        )
-        price_text = price_tag.get_text(strip=True) if price_tag else ""
-        price = _parse_price(price_text)
-
-        # Регион заказчика
-        region = None
-        # Ищем в блоках с регионом
-        for block in card.select("div.registry-entry__body-href"):
-            text = block.get_text(" ", strip=True)
-            if "Регион" in text:
-                parts = text.split(":")
-                if len(parts) > 1:
-                    region = parts[-1].strip()[:100]
-                    break
-        # Ищем в адресе заказчика
-        if not region:
-            for tag in card.select("span.section__info, div.registry-entry__body-value"):
-                text = tag.get_text(strip=True)
-                # Типичные названия регионов содержат "область", "край", "республика"
-                if any(w in text.lower() for w in ["область", "край", "республика", "округ", "москва", "петербург"]):
-                    region = text[:100]
-                    break
-
-        # Сроки подачи
-        dates = card.select("div.data-block__value, span.date-value")
-        deadline = dates[1].get_text(strip=True) if len(dates) > 1 else (
-            dates[0].get_text(strip=True) if dates else None
-        )
-
-        # Статус
-        status_tag = card.select_one(
-            "div.registry-entry__header-top__title, "
-            "span.label-primary, span.status"
-        )
-        status = status_tag.get_text(strip=True) if status_tag else "Активен"
-
-        return {
-            "tender_number": number,
-            "title": title[:500] if title else "Без названия",
-            "region": region[:200] if region else None,
-            "price": price,
-            "deadline": deadline,
-            "status": status,
-            "url": url,
-        }
+        async with session.get(
+            f"{TENDERPLAN_API}/tenders/contracts",
+            params={"id": tender_id},
+            headers=get_headers(),
+            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data if isinstance(data, list) else data.get("contracts", [])
     except Exception as e:
-        logger.debug("Ошибка разбора карточки: %s", e)
+        logger.debug("tp_get_contracts error: %s", e)
+    return []
+
+
+def parse_tender_from_api(item: dict, keyword: str) -> Optional[dict]:
+    """Преобразовать ответ API в наш формат."""
+    tid = item.get("_id")
+    if not tid:
         return None
 
-
-async def parse_eis_search(session: aiohttp.ClientSession,
-                            keyword: str, page: int = 1) -> list[dict]:
-    """Парсить страницу результатов ЕИС по ключевому слову."""
-    params = {
-        "searchString": keyword,
-        "morphology": "on",
-        "search-filter": "Дата+размещения",
-        "pageNumber": page,
-        "sortDirection": "false",
-        "recordsPerPage": "_10",
-        "showLotsInfoHidden": "false",
-        "fz44": "on",
-        "fz223": "on",
-        "af": "on",
-    }
-    html = await fetch_with_retry(
-        session,
-        "https://zakupki.gov.ru/epz/order/extendedsearch/results.html",
-        params=params
-    )
-    if not html:
-        return []
-
-    soup = BeautifulSoup(html, "html.parser")
-    cards = soup.select(
-        "div.search-registry-entry-block, "
-        "div.registry-entry__body, "
-        "article.registry-entry"
-    )
-
-    results = []
-    for card in cards:
-        t = parse_tender_card(card)
-        if t:
-            results.append(t)
-
-    return results
-
-
-async def check_tender_status(session: aiohttp.ClientSession,
-                               tender: dict) -> Optional[dict]:
-    """
-    Проверить статус тендера на странице ЕИС.
-    Возвращает dict с итоговыми данными если тендер завершён.
-    """
-    if not tender.get("url"):
+    title = clean_html(item.get("orderName", ""))
+    if not title:
         return None
 
-    html = await fetch_with_retry(session, tender["url"])
-    if not html:
-        return None
+    price = item.get("maxPrice")
+    deadline_ts = item.get("submissionCloseDateTime")
+    deadline = fmt_ts(deadline_ts)
+    pub_ts = item.get("publicationDateTime")
 
-    soup = BeautifulSoup(html, "html.parser")
+    # Статус
+    status_map = {1: "Активен", 2: "На рассмотрении", 3: "Завершён",
+                  4: "Отменён", 5: "Не состоялся"}
+    status_code = item.get("status", 1)
+    status = status_map.get(status_code, "Активен")
 
-    # Проверяем статус
-    status_tag = soup.select_one(
-        "span.navBreadcrumb, div.procurement-stage, "
-        "span.label-default, div.col-6 span"
-    )
-    status_text = status_tag.get_text(strip=True).lower() if status_tag else ""
-
-    completed_keywords = [
-        "завершена", "завершён", "исполнение", "контракт заключён",
-        "отменена", "несостоявшаяся", "итоги подведены"
-    ]
-    is_completed = any(kw in status_text for kw in completed_keywords)
-
-    if not is_completed:
-        return None
-
-    # Ищем победителя и итоговую цену
-    winner = None
-    final_price = None
-
-    # Итоговая цена из контракта
-    for tag in soup.select("div.col, span.price, div.price-block"):
-        text = tag.get_text(" ", strip=True)
-        if any(w in text.lower() for w in ["цена контракта", "итоговая цена", "сумма контракта"]):
-            price_match = re.search(r"[\d\s]+[,.]?\d*", text.replace("\u00a0", " "))
-            if price_match:
-                final_price = _parse_price(price_match.group())
-                break
-
-    # Победитель
-    for tag in soup.select("div.col, span, div.winner"):
-        text = tag.get_text(" ", strip=True)
-        if any(w in text.lower() for w in ["победитель", "поставщик", "исполнитель"]):
-            lines = [l.strip() for l in text.split("\n") if l.strip()]
-            if len(lines) > 1:
-                winner = lines[1][:300]
-                break
+    # URL на tenderplan
+    url = f"https://tenderplan.ru/tender/{tid}"
 
     return {
-        "final_price": final_price,
-        "winner": winner,
-        "finished_at": datetime.utcnow().isoformat(),
+        "tender_id": tid,
+        "title": title,
+        "region": None,  # заполним из полной инфо
+        "keyword": keyword,
+        "price": price,
+        "deadline": deadline,
+        "status": status,
+        "url": url,
+        "published_at": fmt_ts(pub_ts),
+        "status_code": status_code,
     }
 
 
@@ -657,92 +496,107 @@ async def check_tender_status(session: aiohttp.ClientSession,
 # ═══════════════════════════════════════════════════════════
 
 async def run_update(bot: Bot):
-    """Основной цикл: парсинг новых + обновление статусов."""
+    """Основной цикл обновления."""
     logger.info("=== Обновление: %s ===", datetime.now().strftime("%d.%m.%Y %H:%M"))
 
-    new_tenders: list[dict] = []
-    seen_numbers: set[str] = set()
+    new_tenders = []
+    completed_tenders = []
 
     async with aiohttp.ClientSession() as session:
         # 1. Поиск новых тендеров
-        for keyword in SEARCH_KEYWORDS:
-            for page in range(1, MAX_PAGES + 1):
-                logger.info("ЕИС поиск: '%s', стр. %d", keyword, page)
-                batch = await parse_eis_search(session, keyword, page)
-                if not batch:
-                    break
-                for t in batch:
-                    if t["tender_number"] not in seen_numbers:
-                        seen_numbers.add(t["tender_number"])
-                        is_new = await upsert_active_tender(t)
-                        if is_new:
-                            new_tenders.append(t)
-                await asyncio.sleep(REQUEST_DELAY)
+        seen_ids: set[str] = set()
+        for kw in SEARCH_KEYWORDS:
+            items = await tp_search(session, kw, page=1, count=50)
+            if not items:
+                logger.info("Tenderplan '%s': 0 результатов", kw)
+            for item in items:
+                t = parse_tender_from_api(item, kw)
+                if not t or t["tender_id"] in seen_ids:
+                    continue
+                seen_ids.add(t["tender_id"])
 
-        # 2. Проверка статусов активных тендеров
-        active = await get_active_tenders(limit=50)
-        logger.info("Проверяем статусы %d активных тендеров", len(active))
+                # Завершённые переносим в finished
+                if t.get("status_code") in (3, 4, 5):
+                    # Пробуем получить победителя
+                    contracts = await tp_get_contracts(session, t["tender_id"])
+                    winner = None
+                    final_price = None
+                    if contracts:
+                        c = contracts[0]
+                        winner = c.get("supplierName") or c.get("winner")
+                        final_price = c.get("price") or c.get("finalPrice")
+                    await move_to_finished(
+                        t["tender_id"], final_price, winner,
+                        datetime.utcnow().isoformat()
+                    )
+                    continue
 
-        completed_tenders = []
-        for t in active:
-            result = await check_tender_status(session, t)
-            if result:
-                await move_to_finished(
-                    t["tender_number"],
-                    result.get("final_price"),
-                    result.get("winner"),
-                    result.get("finished_at"),
-                )
-                # Получаем перенесённый тендер для уведомления
-                finished = await get_finished_tenders(limit=1)
-                if finished and finished[0]["tender_number"] == t["tender_number"]:
-                    completed_tenders.append(finished[0])
+                is_new = await upsert_active(t)
+                if is_new:
+                    new_tenders.append(t)
             await asyncio.sleep(REQUEST_DELAY)
 
+        # 2. Проверяем статусы активных тендеров
+        active = await get_active(limit=100)
+        logger.info("Проверяем %d активных тендеров", len(active))
+        for t in active:
+            full = await tp_get_tender(session, t["tender_id"])
+            if not full:
+                await asyncio.sleep(0.5)
+                continue
+            status_code = full.get("status")
+            if status_code in (3, 4, 5):
+                contracts = await tp_get_contracts(session, t["tender_id"])
+                winner = None
+                final_price = None
+                if contracts:
+                    c = contracts[0]
+                    winner = c.get("supplierName") or c.get("winner")
+                    final_price = c.get("price") or c.get("finalPrice")
+                await move_to_finished(
+                    t["tender_id"], final_price, winner,
+                    datetime.utcnow().isoformat()
+                )
+                # Получаем для уведомления
+                finished = await get_finished(limit=1)
+                if finished and finished[0]["tender_id"] == t["tender_id"]:
+                    completed_tenders.append(finished[0])
+            await asyncio.sleep(0.5)
+
     logger.info("Новых: %d, Завершённых: %d", len(new_tenders), len(completed_tenders))
-
-    # 3. Уведомления подписчикам
     if new_tenders or completed_tenders:
-        await notify_subscribers(bot, new_tenders, completed_tenders)
+        await notify_all(bot, new_tenders, completed_tenders)
 
 
-async def notify_subscribers(bot: Bot, new_tenders: list, completed_tenders: list):
-    """Рассылка уведомлений."""
+async def notify_all(bot: Bot, new_list: list, done_list: list):
     from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
-
-    subscribers = await get_subscribers()
-    for chat_id in subscribers:
-        # Новые тендеры
-        if new_tenders:
+    subs = await get_subscribers()
+    for chat_id in subs:
+        if new_list:
             try:
                 await bot.send_message(
                     chat_id,
-                    f"🔔 <b>Новых тендеров: {len(new_tenders)}</b>",
+                    f"🔔 <b>Новых тендеров: {len(new_list)}</b>",
                     parse_mode="HTML"
                 )
-                for t in new_tenders[:5]:  # максимум 5 в одном уведомлении
+                for t in new_list[:5]:
                     await bot.send_message(
-                        chat_id,
-                        format_active_card(t),
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
+                        chat_id, format_active_card(t),
+                        parse_mode="HTML", disable_web_page_preview=True
                     )
             except (TelegramForbiddenError, TelegramBadRequest):
                 pass
             except Exception as e:
-                logger.error("Ошибка уведомления %s: %s", chat_id, e)
-
-        # Завершённые тендеры
-        for t in completed_tenders[:3]:
+                logger.error("notify error %s: %s", chat_id, e)
+        for t in done_list[:3]:
             try:
                 await bot.send_message(
                     chat_id,
                     "🏁 <b>Тендер завершён!</b>\n\n" + format_finished_card(t),
-                    parse_mode="HTML",
-                    disable_web_page_preview=True
+                    parse_mode="HTML", disable_web_page_preview=True
                 )
             except Exception as e:
-                logger.error("Ошибка уведомления завершённого %s: %s", chat_id, e)
+                logger.error("notify done error %s: %s", chat_id, e)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -751,11 +605,11 @@ async def notify_subscribers(bot: Bot, new_tenders: list, completed_tenders: lis
 
 router = Router()
 
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🆕 Новые тендеры"), KeyboardButton(text="🏁 Завершённые")],
         [KeyboardButton(text="📊 Сводка новых"), KeyboardButton(text="📊 Сводка завершённых")],
-        [KeyboardButton(text="🔄 Обновить сейчас"), KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
 )
@@ -765,61 +619,48 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 async def cmd_start(message: Message):
     await subscribe(message.chat.id)
     await message.answer(
-        "👋 <b>Бот мониторинга тендеров ЕИС</b>\n\n"
-        "Слежу за тендерами по металлолому и ломам на zakupki.gov.ru.\n\n"
+        "👋 <b>Бот мониторинга тендеров по металлолому</b>\n\n"
+        "Источник: <b>Tenderplan</b> — все площадки России\n\n"
         "<b>Команды:</b>\n"
         "/new — активные тендеры\n"
-        "/finished — завершённые тендеры\n"
+        "/finished — завершённые с победителями\n"
         "/new_summary — сводка по активным\n"
         "/finished_summary — сводка по завершённым\n"
-        "/update — запустить обновление сейчас",
+        "/search [регион] — поиск по региону\n"
+        "/update — обновить сейчас",
         parse_mode="HTML",
-        reply_markup=MAIN_KEYBOARD,
+        reply_markup=KEYBOARD,
     )
 
 
 @router.message(Command("new"))
 @router.message(lambda m: m.text == "🆕 Новые тендеры")
 async def cmd_new(message: Message):
-    tenders = await get_active_tenders(limit=10)
+    tenders = await get_active(limit=10)
     if not tenders:
         await message.answer(
-            "📭 Активных тендеров пока нет.\n"
-            "Нажмите 🔄 Обновить сейчас или подождите — бот проверяет каждые 30 минут.",
+            "📭 Активных тендеров пока нет.\nНажмите 🔄 Обновить.",
             parse_mode="HTML"
         )
         return
-    await message.answer(
-        f"🆕 <b>Активные тендеры</b> ({len(tenders)} из базы):",
-        parse_mode="HTML"
-    )
+    await message.answer(f"🆕 <b>Активные тендеры</b> ({len(tenders)} шт.):", parse_mode="HTML")
     for t in tenders:
         await message.answer(
-            format_active_card(t),
-            parse_mode="HTML",
-            disable_web_page_preview=True
+            format_active_card(t), parse_mode="HTML", disable_web_page_preview=True
         )
 
 
 @router.message(Command("finished"))
 @router.message(lambda m: m.text == "🏁 Завершённые")
 async def cmd_finished(message: Message):
-    tenders = await get_finished_tenders(limit=10)
+    tenders = await get_finished(limit=10)
     if not tenders:
-        await message.answer(
-            "📭 Завершённых тендеров пока нет.",
-            parse_mode="HTML"
-        )
+        await message.answer("📭 Завершённых тендеров пока нет.", parse_mode="HTML")
         return
-    await message.answer(
-        f"🏁 <b>Завершённые тендеры</b> ({len(tenders)} из базы):",
-        parse_mode="HTML"
-    )
+    await message.answer(f"🏁 <b>Завершённые тендеры</b> ({len(tenders)} шт.):", parse_mode="HTML")
     for t in tenders:
         await message.answer(
-            format_finished_card(t),
-            parse_mode="HTML",
-            disable_web_page_preview=True
+            format_finished_card(t), parse_mode="HTML", disable_web_page_preview=True
         )
 
 
@@ -837,10 +678,27 @@ async def cmd_finished_summary(message: Message):
     await message.answer(format_finished_summary(data), parse_mode="HTML")
 
 
+@router.message(Command("search"))
+async def cmd_search(message: Message, command: CommandObject):
+    region = command.args
+    if not region:
+        await message.answer("ℹ️ Пример: <code>/search Москва</code>", parse_mode="HTML")
+        return
+    tenders = await get_active(limit=10, region=region)
+    if not tenders:
+        await message.answer(f"📭 Тендеры по <b>{region}</b> не найдены.", parse_mode="HTML")
+        return
+    await message.answer(f"🔍 <b>{region}</b> ({len(tenders)} шт.):", parse_mode="HTML")
+    for t in tenders:
+        await message.answer(
+            format_active_card(t), parse_mode="HTML", disable_web_page_preview=True
+        )
+
+
 @router.message(Command("update"))
-@router.message(lambda m: m.text == "🔄 Обновить сейчас")
+@router.message(lambda m: m.text == "🔄 Обновить")
 async def cmd_update(message: Message):
-    await message.answer("🔄 Запускаю обновление... Займёт 5-15 минут.", parse_mode="HTML")
+    await message.answer("🔄 Запускаю обновление... 5-10 минут.", parse_mode="HTML")
     asyncio.create_task(run_update(message.bot))
 
 
@@ -850,28 +708,16 @@ async def cmd_help(message: Message):
     await cmd_start(message)
 
 
-@router.message(Command("search"))
-async def cmd_search(message: Message, command: CommandObject):
-    region = command.args
-    if not region:
-        await message.answer("ℹ️ Пример: <code>/search Москва</code>", parse_mode="HTML")
-        return
-    tenders = await get_active_tenders(limit=10, region=region)
-    if not tenders:
-        await message.answer(f"📭 Тендеры по региону <b>{region}</b> не найдены.", parse_mode="HTML")
-        return
-    await message.answer(f"🔍 <b>Тендеры: {region}</b> ({len(tenders)} шт.):", parse_mode="HTML")
-    for t in tenders:
-        await message.answer(format_active_card(t), parse_mode="HTML", disable_web_page_preview=True)
-
-
 # ═══════════════════════════════════════════════════════════
 #  ЗАПУСК
 # ═══════════════════════════════════════════════════════════
 
 async def main():
     if BOT_TOKEN == "ВСТАВЬТЕ_ТОКЕН_СЮДА":
-        logger.error("Укажите BOT_TOKEN в переменной окружения!")
+        logger.error("Укажите BOT_TOKEN!")
+        return
+    if TENDERPLAN_TOKEN == "ВСТАВЬТЕ_TENDERPLAN_TOKEN":
+        logger.error("Укажите TENDERPLAN_TOKEN!")
         return
 
     await init_db()
@@ -889,11 +735,10 @@ async def main():
         minutes=UPDATE_INTERVAL_MINUTES,
         args=[bot],
         next_run_time=datetime.now(),
-        id="update_tenders",
+        id="update",
     )
     scheduler.start()
-    logger.info("Планировщик запущен (каждые %d мин)", UPDATE_INTERVAL_MINUTES)
-    logger.info("Бот запущен ✅")
+    logger.info("Бот запущен ✅ (обновление каждые %d мин)", UPDATE_INTERVAL_MINUTES)
 
     try:
         await dp.start_polling(bot, allowed_updates=["message"])
