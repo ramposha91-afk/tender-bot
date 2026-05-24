@@ -25,8 +25,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAH6Lx0qG8Fp0LfeQAp8nw3GChXDXGHNGfw")
-TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "2cface68d403d496ac0ac2c8d27d98a25654472d3bf532ca39e56045a57c2d37bf7833c46abfce40d47f9fd81d97a1f9ce90b773dc5e0e6ff39d0ec942ec402c")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "ВСТАВЬТЕ_TENDERPLAN_TOKEN")
 
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30
@@ -309,14 +309,25 @@ def fmt_price(price: Optional[float]) -> str:
     return f"{price:.2f} ₽"
 
 
-def fmt_ts(ts_ms: Optional[int]) -> Optional[str]:
-    """Timestamp в миллисекундах → строка даты."""
-    if not ts_ms:
+def fmt_ts(value) -> Optional[str]:
+    """Timestamp/date string → строка даты."""
+    if not value:
         return None
     try:
-        return datetime.fromtimestamp(ts_ms / 1000).strftime("%d.%m.%Y %H:%M")
+        if isinstance(value, str):
+            raw = value.strip()
+            if raw.isdigit():
+                value = int(raw)
+            else:
+                # Если API уже дал дату строкой — оставляем её читаемо.
+                return raw.replace("T", " ")[:16]
+        if isinstance(value, (int, float)):
+            # 13 цифр = миллисекунды, 10 цифр = секунды
+            ts = value / 1000 if value > 10_000_000_000 else value
+            return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
     except Exception:
         return None
+    return None
 
 
 def format_active_card(t: dict) -> str:
@@ -382,6 +393,33 @@ def format_finished_summary(data: dict) -> str:
     return "\n".join(lines)
 
 
+
+
+def first_value(data: dict, keys: list[str]):
+    """Вернуть первое непустое значение из списка возможных ключей API."""
+    for key in keys:
+        if key in data and data.get(key) not in (None, "", []):
+            return data.get(key)
+    return None
+
+
+def normalize_tender_items(data):
+    """Tenderplan может возвращать список или dict с разными ключами результатов."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("tenders", "items", "results", "data", "list", "rows", "documents"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            for inner_key in ("tenders", "items", "results", "data", "list", "rows"):
+                inner_value = value.get(inner_key)
+                if isinstance(inner_value, list):
+                    return inner_value
+    return []
+
 # ═══════════════════════════════════════════════════════════
 #  TENDERPLAN API
 # ═══════════════════════════════════════════════════════════
@@ -397,7 +435,7 @@ def get_headers() -> dict:
 
 async def tp_search(session: aiohttp.ClientSession,
                     keyword: str, page: int = 1, count: int = 50) -> list[dict]:
-    """Поиск тендеров через Tenderplan API."""
+    """Поиск тендеров через Tenderplan API с диагностикой формата ответа."""
     payload = {
         "access_token": TENDERPLAN_TOKEN,
         "text": keyword,
@@ -412,15 +450,30 @@ async def tp_search(session: aiohttp.ClientSession,
                 headers=get_headers(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as resp:
+                body = await resp.text()
                 if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("tenders", [])
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        logger.warning("Tenderplan '%s': HTTP 200, но ответ не JSON: %s", keyword, body[:500])
+                        return []
+
+                    items = normalize_tender_items(data)
+                    if isinstance(data, dict):
+                        logger.info("Tenderplan '%s': HTTP 200, ключи ответа=%s, найдено raw=%d",
+                                    keyword, list(data.keys())[:12], len(items))
+                    else:
+                        logger.info("Tenderplan '%s': HTTP 200, ответ list, найдено raw=%d", keyword, len(items))
+
+                    if items:
+                        logger.info("Tenderplan '%s': пример полей 1-го тендера=%s",
+                                    keyword, list(items[0].keys())[:20] if isinstance(items[0], dict) else type(items[0]))
+                    return items
                 elif resp.status == 429:
-                    logger.warning("Rate limit, ждём 10 сек")
+                    logger.warning("Rate limit Tenderplan, ждём 10 сек")
                     await asyncio.sleep(10)
                 else:
-                    body = await resp.text()
-                    logger.warning("Tenderplan search '%s': HTTP %s, body: %s", keyword, resp.status, body[:500])
+                    logger.warning("Tenderplan search '%s': HTTP %s, body: %s", keyword, resp.status, body[:700])
                     return []
         except asyncio.TimeoutError:
             logger.warning("Таймаут Tenderplan (попытка %d)", attempt)
@@ -465,40 +518,73 @@ async def tp_get_contracts(session: aiohttp.ClientSession, tender_id: str) -> li
 
 
 def parse_tender_from_api(item: dict, keyword: str) -> Optional[dict]:
-    """Преобразовать ответ API в наш формат."""
-    tid = item.get("_id")
+    """Преобразовать ответ API в наш формат. Поддерживает несколько вариантов названий полей."""
+    if not isinstance(item, dict):
+        return None
+
+    tid = first_value(item, [
+        "_id", "id", "tenderId", "tender_id", "noticeId", "purchaseId",
+        "number", "registryNumber", "notificationNumber", "purchaseNumber"
+    ])
     if not tid:
+        logger.info("Пропуск: не нашёл ID. Поля=%s", list(item.keys())[:20])
         return None
+    tid = str(tid)
 
-    title = clean_html(item.get("orderName", ""))
+    title = clean_html(str(first_value(item, [
+        "orderName", "name", "title", "purchaseName", "objectName", "subject",
+        "lotName", "tenderName", "description", "placingWayName"
+    ]) or ""))
     if not title:
+        logger.info("Пропуск %s: не нашёл название. Поля=%s", tid, list(item.keys())[:20])
         return None
 
-    price = item.get("maxPrice")
-    deadline_ts = item.get("submissionCloseDateTime")
-    deadline = fmt_ts(deadline_ts)
-    pub_ts = item.get("publicationDateTime")
+    price = first_value(item, [
+        "maxPrice", "initialPrice", "initialContractPrice", "nmck", "price",
+        "sum", "amount", "startPrice", "lotPrice"
+    ])
+    try:
+        price = float(str(price).replace(" ", "").replace(",", ".")) if price not in (None, "") else None
+    except Exception:
+        price = None
 
-    # Статус
-    status_map = {1: "Активен", 2: "На рассмотрении", 3: "Завершён",
-                  4: "Отменён", 5: "Не состоялся"}
-    status_code = item.get("status", 1)
-    status = status_map.get(status_code, "Активен")
+    deadline = fmt_ts(first_value(item, [
+        "submissionCloseDateTime", "submissionCloseDate", "endDate", "deadline",
+        "biddingDateEnd", "requestReceivingEndDate", "finishDate", "dateEnd"
+    ]))
+    published_at = fmt_ts(first_value(item, [
+        "publicationDateTime", "publicationDate", "publishDate", "createDate", "datePublished"
+    ]))
 
-    # URL на tenderplan
-    url = f"https://tenderplan.ru/app/analytics/tender/{tid}"
+    status_code = first_value(item, ["status", "statusCode", "state", "tenderStatus"])
+    status_map = {1: "Активен", 2: "На рассмотрении", 3: "Завершён", 4: "Отменён", 5: "Не состоялся"}
+    try:
+        status_code_int = int(status_code)
+    except Exception:
+        status_code_int = 1
+    status = status_map.get(status_code_int, str(status_code) if status_code else "Активен")
+
+    region = first_value(item, [
+        "regionName", "region", "customerRegion", "deliveryRegion", "subjectRF", "placeName"
+    ])
+    if isinstance(region, dict):
+        region = first_value(region, ["name", "title", "regionName"])
+
+    url = first_value(item, ["url", "href", "tenderUrl", "link"])
+    if not url:
+        url = f"https://tenderplan.ru/app/analytics/tender/{tid}"
 
     return {
         "tender_id": tid,
         "title": title,
-        "region": None,  # заполним из полной инфо
+        "region": region,
         "keyword": keyword,
         "price": price,
         "deadline": deadline,
         "status": status,
         "url": url,
-        "published_at": fmt_ts(pub_ts),
-        "status_code": status_code,
+        "published_at": published_at,
+        "status_code": status_code_int,
     }
 
 
@@ -526,9 +612,19 @@ async def run_update(bot: Bot):
                 if not items:
                     logger.info("Tenderplan '%s': 0 результатов", kw)
 
+                parsed_count = 0
+                saved_count = 0
+                duplicate_count = 0
+                filtered_count = 0
+
                 for item in items:
                     t = parse_tender_from_api(item, kw)
-                    if not t or t["tender_id"] in seen_ids:
+                    if not t:
+                        filtered_count += 1
+                        continue
+                    parsed_count += 1
+                    if t["tender_id"] in seen_ids:
+                        duplicate_count += 1
                         continue
                     seen_ids.add(t["tender_id"])
 
@@ -547,9 +643,16 @@ async def run_update(bot: Bot):
                         )
                         continue
 
+                    before_new_count = len(new_tenders)
                     is_new = await upsert_active(t)
                     if is_new:
                         new_tenders.append(t)
+                        saved_count += 1
+                    elif len(new_tenders) == before_new_count and not is_metal_tender(t.get("title", "")):
+                        filtered_count += 1
+
+                logger.info("Tenderplan '%s': raw=%d, parsed=%d, duplicates=%d, saved_new=%d, filtered/skipped=%d",
+                            kw, len(items), parsed_count, duplicate_count, saved_count, filtered_count)
 
                 await asyncio.sleep(REQUEST_DELAY)
 
