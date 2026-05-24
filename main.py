@@ -10,7 +10,7 @@ import html
 import logging
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 import aiohttp
@@ -25,8 +25,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 #  НАСТРОЙКИ
 # ═══════════════════════════════════════════════════════════
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8808326457:AAFQwAIBxDw8f0T7egIE4Lo2_P6zoEsbyQg")
-TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "85ee03665e6fb1379da6cb7b9a43ac6acee833e46e9e11ac17e6950164bf20335795a3acd8c4b7540b606cab6837136a7b4fa191f73152ed44bb37eb0a440c83")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_ТОКЕН_СЮДА")
+TENDERPLAN_TOKEN: str = os.getenv("TENDERPLAN_TOKEN", "ВСТАВЬТЕ_TENDERPLAN_TOKEN")
 
 DB_PATH: str = "tenders.db"
 UPDATE_INTERVAL_MINUTES: int = 30
@@ -66,6 +66,7 @@ REQUEST_TIMEOUT: int = 30
 REQUEST_DELAY: float = 1.0
 MAX_RETRIES: int = 3
 TENDERPLAN_API: str = "https://tenderplan.ru/api"
+_update_lock = asyncio.Lock()
 
 # ═══════════════════════════════════════════════════════════
 #  ЛОГИРОВАНИЕ
@@ -203,7 +204,7 @@ async def move_to_finished(tender_id: str, final_price: Optional[float],
                (tender_id,title,region,start_price,final_price,winner,finished_at,url)
                VALUES (?,?,?,?,?,?,?,?)""",
             (tender_id, t.get("title"), t.get("region"), t.get("price"),
-             final_price, winner, finished_at or now, t.get("url"))
+             final_price, winner, finished_at or datetime.utcnow().isoformat(), t.get("url"))
         )
         await db.execute("DELETE FROM active_tenders WHERE tender_id=?", (tender_id,))
         await db.commit()
@@ -384,42 +385,65 @@ def format_finished_summary(data: dict) -> str:
 # ═══════════════════════════════════════════════════════════
 
 def get_headers() -> dict:
+    # В документации Tenderplan указано, что ключ передаётся как access_token.
+    # Header оставляем запасным вариантом, если у аккаунта включена Bearer-авторизация.
     return {
         "Authorization": f"Bearer {TENDERPLAN_TOKEN}",
         "Content-Type": "application/json",
-        "Accept": "*/*",
+        "Accept": "application/json",
     }
 
 
 async def tp_search(session: aiohttp.ClientSession,
                     keyword: str, page: int = 1, count: int = 50) -> list[dict]:
     """Поиск тендеров через Tenderplan API."""
-    payload = {
-        "text": keyword,
-        "page": page,
-        "count": count,
-    }
+    payload = {"text": keyword, "page": page, "count": count}
+    params = {"access_token": TENDERPLAN_TOKEN}
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             async with session.post(
                 f"{TENDERPLAN_API}/search/list",
+                params=params,
                 json=payload,
                 headers=get_headers(),
                 timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
             ) as resp:
+                text = await resp.text()
                 if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("tenders", [])
-                elif resp.status == 429:
-                    logger.warning("Rate limit, ждём 10 сек")
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        logger.warning("Tenderplan вернул не JSON по '%s': %.300s", keyword, text)
+                        return []
+
+                    if isinstance(data, list):
+                        items = data
+                    elif isinstance(data, dict):
+                        items = (
+                            data.get("tenders")
+                            or data.get("items")
+                            or data.get("data")
+                            or data.get("result")
+                            or []
+                        )
+                    else:
+                        items = []
+
+                    logger.info("Tenderplan '%s': %d результатов", keyword, len(items))
+                    return items if isinstance(items, list) else []
+
+                if resp.status == 429:
+                    logger.warning("Tenderplan rate limit по '%s', ждём 10 сек", keyword)
                     await asyncio.sleep(10)
-                else:
-                    logger.warning("Tenderplan search %s: HTTP %s", keyword, resp.status)
-                    return []
+                    continue
+
+                logger.warning("Tenderplan search '%s': HTTP %s, body: %.300s", keyword, resp.status, text)
+                return []
         except asyncio.TimeoutError:
-            logger.warning("Таймаут Tenderplan (попытка %d)", attempt)
+            logger.warning("Таймаут Tenderplan по '%s' (попытка %d)", keyword, attempt)
         except Exception as e:
-            logger.warning("Ошибка Tenderplan: %s", e)
+            logger.warning("Ошибка Tenderplan по '%s': %s", keyword, e)
         if attempt < MAX_RETRIES:
             await asyncio.sleep(2 ** attempt)
     return []
@@ -430,7 +454,7 @@ async def tp_get_tender(session: aiohttp.ClientSession, tender_id: str) -> Optio
     try:
         async with session.get(
             f"{TENDERPLAN_API}/tenders/v2/fullinfo",
-            params={"id": tender_id},
+            params={"id": tender_id, "access_token": TENDERPLAN_TOKEN},
             headers=get_headers(),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
@@ -446,7 +470,7 @@ async def tp_get_contracts(session: aiohttp.ClientSession, tender_id: str) -> li
     try:
         async with session.get(
             f"{TENDERPLAN_API}/tenders/contracts",
-            params={"id": tender_id},
+            params={"id": tender_id, "access_token": TENDERPLAN_TOKEN},
             headers=get_headers(),
             timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
         ) as resp:
@@ -460,16 +484,23 @@ async def tp_get_contracts(session: aiohttp.ClientSession, tender_id: str) -> li
 
 def parse_tender_from_api(item: dict, keyword: str) -> Optional[dict]:
     """Преобразовать ответ API в наш формат."""
-    tid = item.get("_id")
+    tid = item.get("_id") or item.get("id") or item.get("tenderId") or item.get("purchaseNumber")
     if not tid:
+        logger.debug("Пропуск: нет id в item=%s", item)
         return None
 
-    title = clean_html(item.get("orderName", ""))
+    title = clean_html(
+        item.get("orderName")
+        or item.get("name")
+        or item.get("title")
+        or item.get("subject")
+        or ""
+    )
     if not title:
         return None
 
-    price = item.get("maxPrice")
-    deadline_ts = item.get("submissionCloseDateTime")
+    price = item.get("maxPrice") or item.get("startPrice") or item.get("price") or item.get("amount")
+    deadline_ts = item.get("submissionCloseDateTime") or item.get("deadline") or item.get("endDate")
     deadline = fmt_ts(deadline_ts)
     pub_ts = item.get("publicationDateTime")
 
@@ -485,7 +516,7 @@ def parse_tender_from_api(item: dict, keyword: str) -> Optional[dict]:
     return {
         "tender_id": tid,
         "title": title,
-        "region": None,  # заполним из полной инфо
+        "region": item.get("region") or item.get("regionName") or item.get("customerRegion"),
         "keyword": keyword,
         "price": price,
         "deadline": deadline,
@@ -502,6 +533,14 @@ def parse_tender_from_api(item: dict, keyword: str) -> Optional[dict]:
 
 async def run_update(bot: Bot):
     """Основной цикл обновления."""
+    if _update_lock.locked():
+        logger.info("Обновление уже выполняется, второй запуск пропущен")
+        return
+    async with _update_lock:
+        await _run_update_locked(bot)
+
+
+async def _run_update_locked(bot: Bot):
     logger.info("=== Обновление: %s ===", datetime.now().strftime("%d.%m.%Y %H:%M"))
 
     new_tenders = []
