@@ -10,6 +10,8 @@ import html
 import logging
 import os
 import re
+import csv
+import io
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -18,7 +20,7 @@ import aiosqlite
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, BufferedInputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ═══════════════════════════════════════════════════════════
@@ -279,6 +281,183 @@ async def get_finished_summary() -> dict:
         return {"count": r1["cnt"] or 0, "total": r1["total"] or 0,
                 "avg": r1["avg"] or 0, "regions": regions}
 
+
+
+async def get_market_analytics() -> dict:
+    """Аналитика по локальной базе: активные + завершённые."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        active_row = dict(await (await db.execute(
+            "SELECT COUNT(*) cnt, COALESCE(SUM(price),0) total, COALESCE(AVG(price),0) avg_price FROM active_tenders"
+        )).fetchone())
+        finished_row = dict(await (await db.execute(
+            "SELECT COUNT(*) cnt, COALESCE(SUM(start_price),0) total, COALESCE(AVG(final_price),0) avg_final FROM finished_tenders"
+        )).fetchone())
+
+        by_keyword = [dict(r) for r in await (await db.execute(
+            """SELECT COALESCE(keyword,'не указано') keyword, COUNT(*) cnt, COALESCE(SUM(price),0) total
+               FROM active_tenders
+               GROUP BY COALESCE(keyword,'не указано')
+               ORDER BY cnt DESC, total DESC
+               LIMIT 12"""
+        )).fetchall()]
+
+        by_region = [dict(r) for r in await (await db.execute(
+            """SELECT COALESCE(NULLIF(region,''),'не указан') region, COUNT(*) cnt, COALESCE(SUM(price),0) total
+               FROM active_tenders
+               GROUP BY COALESCE(NULLIF(region,''),'не указан')
+               ORDER BY cnt DESC, total DESC
+               LIMIT 12"""
+        )).fetchall()]
+
+        by_status_active = [dict(r) for r in await (await db.execute(
+            """SELECT COALESCE(status,'не указан') status, COUNT(*) cnt, COALESCE(SUM(price),0) total
+               FROM active_tenders
+               GROUP BY COALESCE(status,'не указан')
+               ORDER BY cnt DESC"""
+        )).fetchall()]
+
+        # Месяц берём из published_at, если его нет — из deadline/updated_at.
+        rows = [dict(r) for r in await (await db.execute(
+            "SELECT published_at, deadline, updated_at, price FROM active_tenders"
+        )).fetchall()]
+
+        month_map: dict[str, dict] = {}
+        for r in rows:
+            raw = r.get('published_at') or r.get('deadline') or r.get('updated_at') or ''
+            month = extract_month_label(str(raw))
+            if not month:
+                month = 'дата не указана'
+            item = month_map.setdefault(month, {'month': month, 'cnt': 0, 'total': 0.0})
+            item['cnt'] += 1
+            item['total'] += float(r.get('price') or 0)
+
+        by_month = sorted(month_map.values(), key=lambda x: x['month'])[-12:]
+
+        price_buckets = [
+            ('0–100 тыс', 0, 100_000),
+            ('100 тыс–1 млн', 100_000, 1_000_000),
+            ('1–10 млн', 1_000_000, 10_000_000),
+            ('10–100 млн', 10_000_000, 100_000_000),
+            ('100 млн+', 100_000_000, None),
+            ('без цены', None, None),
+        ]
+        bucket_counts = {b[0]: {'bucket': b[0], 'cnt': 0, 'total': 0.0} for b in price_buckets}
+        for r in await (await db.execute("SELECT price FROM active_tenders")).fetchall():
+            price = r['price']
+            if price is None:
+                bucket_counts['без цены']['cnt'] += 1
+                continue
+            price = float(price)
+            placed = False
+            for name, lo, hi in price_buckets[:-1]:
+                if price >= lo and (hi is None or price < hi):
+                    bucket_counts[name]['cnt'] += 1
+                    bucket_counts[name]['total'] += price
+                    placed = True
+                    break
+            if not placed:
+                bucket_counts['без цены']['cnt'] += 1
+
+        return {
+            'active': active_row,
+            'finished': finished_row,
+            'by_keyword': by_keyword,
+            'by_region': by_region,
+            'by_status_active': by_status_active,
+            'by_month': by_month,
+            'price_buckets': list(bucket_counts.values()),
+        }
+
+
+def extract_month_label(raw: str) -> Optional[str]:
+    """Пытается привести разные строки дат к YYYY-MM."""
+    if not raw:
+        return None
+    raw = raw.strip()
+    # ISO: 2026-05-24...
+    m = re.search(r"(20\d{2})[-.](\d{2})", raw)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    # RU: 24.05.2026
+    m = re.search(r"\b\d{2}\.(\d{2})\.(20\d{2})", raw)
+    if m:
+        return f"{m.group(2)}-{m.group(1)}"
+    return None
+
+
+def bar(cnt: int, max_cnt: int, width: int = 12) -> str:
+    if max_cnt <= 0:
+        return ""
+    n = max(1, round(cnt / max_cnt * width)) if cnt else 0
+    return "█" * n
+
+
+def format_market_analytics(data: dict) -> str:
+    active = data['active']
+    finished = data['finished']
+    total_cnt = int(active['cnt'] or 0) + int(finished['cnt'] or 0)
+    total_sum = float(active['total'] or 0) + float(finished['total'] or 0)
+
+    lines = [
+        "📊 <b>Аналитика по тендерам</b>",
+        "",
+        f"Всего в базе: <b>{total_cnt}</b>",
+        f"Актуальных: <b>{int(active['cnt'] or 0)}</b> на сумму <b>{fmt_price(active['total'])}</b>",
+        f"Завершённых: <b>{int(finished['cnt'] or 0)}</b> на сумму <b>{fmt_price(finished['total'])}</b>",
+        f"Средняя НМЦ актуальных: <b>{fmt_price(active['avg_price'])}</b>",
+        "",
+    ]
+
+    if data.get('by_keyword'):
+        max_cnt = max(int(x['cnt']) for x in data['by_keyword']) or 1
+        lines += ["🔑 <b>Топ по направлениям:</b>"]
+        for x in data['by_keyword'][:8]:
+            lines.append(f"{bar(int(x['cnt']), max_cnt)} {x['keyword']} — {x['cnt']} / {fmt_price(x['total'])}")
+        lines.append("")
+
+    if data.get('by_region'):
+        max_cnt = max(int(x['cnt']) for x in data['by_region']) or 1
+        lines += ["📍 <b>Топ регионов:</b>"]
+        for x in data['by_region'][:8]:
+            lines.append(f"{bar(int(x['cnt']), max_cnt)} {x['region']} — {x['cnt']} / {fmt_price(x['total'])}")
+        lines.append("")
+
+    if data.get('price_buckets'):
+        max_cnt = max(int(x['cnt']) for x in data['price_buckets']) or 1
+        lines += ["💰 <b>Диапазоны НМЦ:</b>"]
+        for x in data['price_buckets']:
+            if int(x['cnt']) > 0:
+                lines.append(f"{bar(int(x['cnt']), max_cnt)} {x['bucket']} — {x['cnt']}")
+        lines.append("")
+
+    if data.get('by_month'):
+        max_cnt = max(int(x['cnt']) for x in data['by_month']) or 1
+        lines += ["📅 <b>Динамика по месяцам:</b>"]
+        for x in data['by_month'][-8:]:
+            lines.append(f"{bar(int(x['cnt']), max_cnt)} {x['month']} — {x['cnt']} / {fmt_price(x['total'])}")
+
+    return "\n".join(lines)
+
+
+async def build_tenders_csv() -> bytes:
+    """CSV-выгрузка активных тендеров, открывается в Excel."""
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(['id', 'Название', 'Регион', 'Направление', 'Цена', 'Срок подачи', 'Статус', 'Ссылка'])
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await (await db.execute(
+            "SELECT tender_id,title,region,keyword,price,deadline,status,url FROM active_tenders ORDER BY updated_at DESC"
+        )).fetchall()
+        for r in rows:
+            writer.writerow([
+                r['tender_id'], r['title'], r['region'] or '', r['keyword'] or '',
+                r['price'] if r['price'] is not None else '', r['deadline'] or '',
+                r['status'] or '', r['url'] or ''
+            ])
+    return ('\ufeff' + output.getvalue()).encode('utf-8')
 
 async def subscribe(chat_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -729,6 +908,7 @@ router = Router()
 KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🆕 Новые тендеры"), KeyboardButton(text="🏁 Завершённые")],
+        [KeyboardButton(text="📊 Аналитика"), KeyboardButton(text="📤 Excel/CSV")],
         [KeyboardButton(text="📊 Сводка новых"), KeyboardButton(text="📊 Сводка завершённых")],
         [KeyboardButton(text="🔄 Обновить"), KeyboardButton(text="❓ Помощь")],
     ],
@@ -797,6 +977,22 @@ async def cmd_new_summary(message: Message):
 async def cmd_finished_summary(message: Message):
     data = await get_finished_summary()
     await message.answer(format_finished_summary(data), parse_mode="HTML")
+
+
+
+@router.message(Command("analytics"))
+@router.message(lambda m: m.text == "📊 Аналитика")
+async def cmd_analytics(message: Message):
+    data = await get_market_analytics()
+    await message.answer(format_market_analytics(data), parse_mode="HTML")
+
+
+@router.message(Command("export"))
+@router.message(lambda m: m.text == "📤 Excel/CSV")
+async def cmd_export(message: Message):
+    csv_bytes = await build_tenders_csv()
+    file = BufferedInputFile(csv_bytes, filename="tenders_export.csv")
+    await message.answer_document(file, caption="📤 Выгрузка активных тендеров для Excel")
 
 
 @router.message(Command("search"))
