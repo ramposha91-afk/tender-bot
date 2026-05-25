@@ -11,7 +11,6 @@ import asyncio
 import csv
 import html
 import io
-import json
 import logging
 import os
 import re
@@ -177,161 +176,6 @@ def escape(s: Any) -> str:
     return html.escape(str(s or ""))
 
 
-REGION_MAP = {
-    1: "Республика Адыгея", 2: "Республика Башкортостан", 3: "Республика Бурятия",
-    4: "Республика Алтай", 5: "Республика Дагестан", 6: "Республика Ингушетия",
-    7: "Кабардино-Балкарская Республика", 8: "Республика Калмыкия",
-    9: "Карачаево-Черкесская Республика", 10: "Республика Карелия", 11: "Республика Коми",
-    12: "Республика Марий Эл", 13: "Республика Мордовия", 14: "Республика Саха (Якутия)",
-    15: "Республика Северная Осетия — Алания", 16: "Республика Татарстан",
-    17: "Республика Тыва", 18: "Удмуртская Республика", 19: "Республика Хакасия",
-    20: "Чеченская Республика", 21: "Чувашская Республика", 22: "Алтайский край",
-    23: "Краснодарский край", 24: "Красноярский край", 25: "Приморский край",
-    26: "Ставропольский край", 27: "Хабаровский край", 28: "Амурская область",
-    29: "Архангельская область", 30: "Астраханская область", 31: "Белгородская область",
-    32: "Брянская область", 33: "Владимирская область", 34: "Волгоградская область",
-    35: "Вологодская область", 36: "Воронежская область", 37: "Ивановская область",
-    38: "Иркутская область", 39: "Калининградская область", 40: "Калужская область",
-    41: "Камчатский край", 42: "Кемеровская область", 43: "Кировская область",
-    44: "Костромская область", 45: "Курганская область", 46: "Курская область",
-    47: "Ленинградская область", 48: "Липецкая область", 49: "Магаданская область",
-    50: "Московская область", 51: "Мурманская область", 52: "Нижегородская область",
-    53: "Новгородская область", 54: "Новосибирская область", 55: "Омская область",
-    56: "Оренбургская область", 57: "Орловская область", 58: "Пензенская область",
-    59: "Пермский край", 60: "Псковская область", 61: "Ростовская область",
-    62: "Рязанская область", 63: "Самарская область", 64: "Саратовская область",
-    65: "Сахалинская область", 66: "Свердловская область", 67: "Смоленская область",
-    68: "Тамбовская область", 69: "Тверская область", 70: "Томская область",
-    71: "Тульская область", 72: "Тюменская область", 73: "Ульяновская область",
-    74: "Челябинская область", 75: "Забайкальский край", 76: "Ярославская область",
-    77: "Москва", 78: "Санкт-Петербург", 79: "Еврейская автономная область",
-    83: "Ненецкий автономный округ", 86: "Ханты-Мансийский автономный округ — Югра",
-    87: "Чукотский автономный округ", 89: "Ямало-Ненецкий автономный округ",
-    91: "Республика Крым", 92: "Севастополь",
-}
-
-
-def region_name(region_code: Any) -> str:
-    try:
-        code = int(region_code)
-        return REGION_MAP.get(code, f"Регион {code}")
-    except Exception:
-        return ""
-
-
-def detect_metal_type(title: str) -> str:
-    t = normalize_text(title)
-    if "алюмин" in t:
-        return "Алюминий"
-    if re.search(r"\bмед[ьи]\b|медн", t):
-        return "Медь"
-    if "латун" in t:
-        return "Латунь"
-    if "цветн" in t or "цветмет" in t:
-        return "Цветные металлы"
-    if "черн" in t or "чермет" in t:
-        return "Черные металлы"
-    if "струж" in t:
-        return "Стружка"
-    if "металлоконструкц" in t:
-        return "Металлоконструкции"
-    return "Металлолом"
-
-
-def _safe_json_loads(value: Any) -> dict:
-    if not value:
-        return {}
-    if isinstance(value, dict):
-        return value
-    try:
-        return json.loads(value)
-    except Exception:
-        return {}
-
-
-def _fv(node: Any) -> Any:
-    return node.get("fv") if isinstance(node, dict) else None
-
-
-def _recursive_find_by_fn_or_fdn(node: Any, names: set[str]) -> Optional[Any]:
-    if isinstance(node, dict):
-        fn = str(node.get("fn") or "").lower()
-        fdn = str(node.get("fdn") or "").lower()
-        if fn in names or fdn in names:
-            return node.get("fv")
-        for v in node.values():
-            found = _recursive_find_by_fn_or_fdn(v, names)
-            if found not in (None, ""):
-                return found
-    elif isinstance(node, list):
-        for v in node:
-            found = _recursive_find_by_fn_or_fdn(v, names)
-            if found not in (None, ""):
-                return found
-    return None
-
-
-def extract_details_fields(details: Optional[dict[str, Any]]) -> dict[str, Any]:
-    if not details:
-        return {}
-
-    embedded = _safe_json_loads(details.get("json"))
-    contacts_info = embedded.get("2", {}).get("fv", {}) if isinstance(embedded, dict) else {}
-    contacts = contacts_info.get("3", {}).get("fv", {}) if isinstance(contacts_info, dict) else {}
-    general = embedded.get("general", {}) if isinstance(embedded, dict) else {}
-
-    fio = _fv(contacts.get("0", {})) if isinstance(contacts, dict) else None
-    phone = _fv(contacts.get("1", {})) if isinstance(contacts, dict) else None
-    email = _fv(contacts.get("3", {})) if isinstance(contacts, dict) else None
-    fact_address = _fv(contacts_info.get("1", {})) if isinstance(contacts_info, dict) else None
-    delivery_place = _fv(general.get("1", {})) if isinstance(general, dict) else None
-
-    if not delivery_place:
-        delivery_place = _recursive_find_by_fn_or_fdn(embedded, {"deliveryplace", "место поставки"})
-    if not fio:
-        fio = _recursive_find_by_fn_or_fdn(embedded, {"fio", "фио"})
-    if not phone:
-        phone = _recursive_find_by_fn_or_fdn(embedded, {"phone", "телефон"})
-    if not email:
-        email = _recursive_find_by_fn_or_fdn(embedded, {"email", "электронная почта"})
-    if not fact_address:
-        fact_address = _recursive_find_by_fn_or_fdn(embedded, {"factaddress", "фактический адрес"})
-
-    customers = details.get("customers") or []
-    customer = customers[0].get("name", "") if customers and isinstance(customers[0], dict) else ""
-    region_code = details.get("region")
-    if not region_code and customers and isinstance(customers[0], dict):
-        region_code = customers[0].get("region")
-    platform = details.get("platform") or {}
-
-    return {
-        "region_code": int(region_code) if str(region_code or "").isdigit() else None,
-        "region_name": region_name(region_code),
-        "delivery_place": clean_html(delivery_place or ""),
-        "contact_person": clean_html(fio or ""),
-        "contact_phone": clean_html(phone or ""),
-        "contact_email": clean_html(email or ""),
-        "customer": clean_html(customer),
-        "fact_address": clean_html(fact_address or ""),
-        "platform_name": clean_html(platform.get("name", "")) if isinstance(platform, dict) else "",
-        "source_url": details.get("href") or "",
-    }
-
-
-def enrich_tender(parsed: dict[str, Any], details: Optional[dict[str, Any]]) -> dict[str, Any]:
-    extra = extract_details_fields(details)
-    if details:
-        parsed["status_code"] = int(details.get("status")) if str(details.get("status", "")).isdigit() else parsed.get("status_code")
-        parsed["status"] = status_name(parsed.get("status_code"))
-        parsed["price"] = safe_float(details.get("maxPrice")) if details.get("maxPrice") is not None else parsed.get("price")
-        parsed["deadline"] = fmt_ts_ms(details.get("submissionCloseDateTime")) or parsed.get("deadline")
-        parsed["published_at"] = fmt_ts_ms(details.get("publicationDateTime")) or parsed.get("published_at")
-    parsed.update(extra)
-    details_text = details.get("tenderSearch", "") if details else ""
-    parsed["metal_type"] = detect_metal_type(f"{parsed.get('title', '')} {details_text}")
-    return parsed
-
-
 # =============================================================================
 # БД
 # =============================================================================
@@ -355,17 +199,6 @@ async def init_db() -> None:
                 placing_way TEXT,
                 currency TEXT,
                 published_at TEXT,
-                region_code INTEGER,
-                region_name TEXT,
-                delivery_place TEXT,
-                contact_person TEXT,
-                contact_phone TEXT,
-                contact_email TEXT,
-                customer TEXT,
-                fact_address TEXT,
-                platform_name TEXT,
-                source_url TEXT,
-                metal_type TEXT,
                 created_at TEXT,
                 updated_at TEXT
             );
@@ -390,23 +223,6 @@ async def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tenders_updated ON tenders(updated_at);
             CREATE INDEX IF NOT EXISTS idx_finished_at ON finished_tenders(finished_at);
         """)
-        for col, col_type in [
-            ("region_code", "INTEGER"),
-            ("region_name", "TEXT"),
-            ("delivery_place", "TEXT"),
-            ("contact_person", "TEXT"),
-            ("contact_phone", "TEXT"),
-            ("contact_email", "TEXT"),
-            ("customer", "TEXT"),
-            ("fact_address", "TEXT"),
-            ("platform_name", "TEXT"),
-            ("source_url", "TEXT"),
-            ("metal_type", "TEXT"),
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE tenders ADD COLUMN {col} {col_type}")
-            except aiosqlite.OperationalError:
-                pass
         await db.commit()
     logger.info("БД готова: %s", DB_PATH)
 
@@ -425,31 +241,33 @@ async def get_subscribers() -> list[int]:
 
 async def upsert_tender(t: dict[str, Any]) -> bool:
     now = datetime.utcnow().isoformat()
-    fields = [
-        "title", "keyword", "price", "deadline", "status_code", "status", "url",
-        "kind", "type", "placing_way", "currency", "published_at",
-        "region_code", "region_name", "delivery_place", "contact_person",
-        "contact_phone", "contact_email", "customer", "fact_address",
-        "platform_name", "source_url", "metal_type",
-    ]
-
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT tender_id FROM tenders WHERE tender_id=?", (t["tender_id"],))
         exists = await cur.fetchone()
-
         if exists:
-            set_clause = ", ".join([f"{f}=?" for f in fields] + ["updated_at=?"])
-            values = [t.get(f) for f in fields] + [now, t["tender_id"]]
-            await db.execute(f"UPDATE tenders SET {set_clause} WHERE tender_id=?", values)
+            await db.execute(
+                """UPDATE tenders SET title=?,keyword=?,price=?,deadline=?,status_code=?,
+                   status=?,url=?,kind=?,type=?,placing_way=?,currency=?,published_at=?,updated_at=?
+                   WHERE tender_id=?""",
+                (t.get("title"), t.get("keyword"), t.get("price"), t.get("deadline"),
+                 t.get("status_code"), t.get("status"), t.get("url"), t.get("kind"),
+                 t.get("type"), t.get("placing_way"), t.get("currency"), t.get("published_at"),
+                 now, t["tender_id"]),
+            )
             await db.commit()
             return False
-
-        insert_fields = ["tender_id"] + fields + ["created_at", "updated_at"]
-        placeholders = ",".join(["?"] * len(insert_fields))
-        values = [t.get("tender_id")] + [t.get(f) for f in fields] + [now, now]
-        await db.execute(f"INSERT INTO tenders ({','.join(insert_fields)}) VALUES ({placeholders})", values)
+        await db.execute(
+            """INSERT INTO tenders (tender_id,title,keyword,price,deadline,status_code,status,
+               url,kind,type,placing_way,currency,published_at,created_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (t.get("tender_id"), t.get("title"), t.get("keyword"), t.get("price"),
+             t.get("deadline"), t.get("status_code"), t.get("status"), t.get("url"),
+             t.get("kind"), t.get("type"), t.get("placing_way"), t.get("currency"),
+             t.get("published_at"), now, now),
+        )
         await db.commit()
         return True
+
 
 async def upsert_finished(t: dict[str, Any]) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -517,40 +335,20 @@ async def get_summary() -> dict[str, Any]:
                SUM(CASE WHEN price>=100000000 THEN 1 ELSE 0 END) AS p_100 FROM tenders"""
         )
         price_ranges = dict(await c4.fetchone())
-        c5 = await db.execute(
-            """SELECT COALESCE(region_name, 'Регион не указан') AS region,
-                      COALESCE(metal_type, 'Не определено') AS metal_type,
-                      COUNT(*) AS cnt,
-                      SUM(price) AS total
-                 FROM tenders
-                GROUP BY COALESCE(region_name, 'Регион не указан'),
-                         COALESCE(metal_type, 'Не определено')
-                ORDER BY cnt DESC, total DESC
-                LIMIT 30"""
-        )
-        by_region_metal = [dict(r) for r in await c5.fetchall()]
         return {"totals": totals, "by_status": by_status,
-                "finished_stats": finished_stats, "price_ranges": price_ranges,
-                "by_region_metal": by_region_metal}
+                "finished_stats": finished_stats, "price_ranges": price_ranges}
+
 
 async def export_csv_bytes() -> bytes:
     rows = await get_tenders(limit=5000, only_active=False)
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
-    writer.writerow([
-        "ID", "Название", "Тип металла", "Регион", "Место поставки",
-        "Контактное лицо", "Телефон", "Email", "Заказчик",
-        "Цена", "Срок подачи", "Статус", "Опубликовано", "Площадка", "Ссылка"
-    ])
+    writer.writerow(["ID", "Название", "Цена", "Срок подачи", "Статус", "Опубликовано", "Ссылка"])
     for r in rows:
-        writer.writerow([
-            r.get("tender_id"), r.get("title"), r.get("metal_type"),
-            r.get("region_name"), r.get("delivery_place"),
-            r.get("contact_person"), r.get("contact_phone"), r.get("contact_email"),
-            r.get("customer"), r.get("price"), r.get("deadline"), r.get("status"),
-            r.get("published_at"), r.get("platform_name"), r.get("url")
-        ])
+        writer.writerow([r.get("tender_id"), r.get("title"), r.get("price"),
+                         r.get("deadline"), r.get("status"), r.get("published_at"), r.get("url")])
     return ("\ufeff" + output.getvalue()).encode("utf-8")
+
 
 # =============================================================================
 # TENDERPLAN API
@@ -591,31 +389,17 @@ async def tp_request_post(session: aiohttp.ClientSession, url: str, payload: dic
 
 
 async def tp_search_by_key(session: aiohttp.ClientSession, page: int = 1, count: int = 50) -> list:
-    # Tenderplan /relations/v2/list требует participants и customers даже если фильтр пустой.
     return await tp_request_post(
         session, f"{TENDERPLAN_API}/relations/v2/list",
-        {
-            "keyId": TENDERPLAN_KEY_ID,
-            "page": page,
-            "count": count,
-            "participants": [],
-            "customers": [],
-        },
+        {"keyId": TENDERPLAN_KEY_ID, "page": page, "count": count}
     )
 
 
 async def tp_search_by_words(session: aiohttp.ClientSession, page: int = 1, count: int = 50) -> list:
-    # Резервный поиск. Добавляем participants/customers на случай единых требований валидатора API.
     return await tp_request_post(
         session, f"{TENDERPLAN_API}/search/list",
-        {
-            "words": {"value": TENDERPLAN_WORDS, "excluded": TENDERPLAN_EXCLUDED},
-            "condition": "or",
-            "page": page,
-            "count": count,
-            "participants": [],
-            "customers": [],
-        },
+        {"words": {"value": TENDERPLAN_WORDS, "excluded": TENDERPLAN_EXCLUDED},
+         "condition": "or", "page": page, "count": count}
     )
 
 
@@ -683,17 +467,10 @@ def parse_tender(item: dict[str, Any], keyword: str = "металлолом") ->
 def format_tender_card(t: dict[str, Any]) -> str:
     return (
         f"🏭 <b>Название:</b> {escape(t.get('title'))}\n"
-        f"📍 <b>Регион:</b> {escape(t.get('region_name') or 'не указан')}\n"
-        f"🧱 <b>Тип металла:</b> {escape(t.get('metal_type') or 'не определён')}\n"
-        f"🚚 <b>Место поставки:</b> {escape(t.get('delivery_place') or 'не указано')}\n"
         f"💰 <b>Начальная цена:</b> {fmt_price(t.get('price'))}\n"
         f"⏰ <b>Срок подачи:</b> {escape(t.get('deadline') or 'не указан')}\n"
         f"📌 <b>Статус:</b> {escape(t.get('status') or 'не указан')}\n"
-        f"👤 <b>Контактное лицо:</b> {escape(t.get('contact_person') or 'не указано')}\n"
-        f"☎️ <b>Телефон:</b> {escape(t.get('contact_phone') or 'не указан')}\n"
-        f"✉️ <b>Email:</b> {escape(t.get('contact_email') or 'не указан')}\n"
-        f"🏢 <b>Заказчик:</b> {escape(t.get('customer') or 'не указан')}\n"
-        f"🏛 <b>Площадка:</b> {escape(t.get('platform_name') or 'Tenderplan')}\n"
+        f"🏛 <b>Площадка:</b> Tenderplan\n"
         f"🔗 <a href=\"{escape(t.get('url'))}\">Открыть тендер</a>"
     )
 
@@ -743,14 +520,6 @@ def format_summary(data: dict[str, Any]) -> str:
         lines += ["", "📌 <b>По статусам:</b>"]
         for r in data["by_status"]:
             lines.append(f"  {escape(r.get('status'))}: {r.get('cnt') or 0} / {fmt_price(r.get('total'))}")
-
-    if data.get("by_region_metal"):
-        lines += ["", "📍 <b>Регион / тип металла / количество:</b>"]
-        for r in data["by_region_metal"][:20]:
-            lines.append(
-                f"  {escape(r.get('region'))} — {escape(r.get('metal_type'))}: "
-                f"{r.get('cnt') or 0} / {fmt_price(r.get('total'))}"
-            )
     return "\n".join(lines)
 
 
@@ -799,10 +568,6 @@ async def run_update(bot: Optional[Bot] = None, notify: bool = True) -> tuple[in
                     duplicate_count += 1
                     continue
                 seen_ids.add(parsed["tender_id"])
-
-                details = await tp_get_tender(session, parsed["tender_id"])
-                parsed = enrich_tender(parsed, details)
-
                 if not is_relevant_tender(parsed.get("title", "")):
                     filtered_count += 1
                     logger.info("ОТФИЛЬТРОВАНО: %s", parsed.get("title", "")[:100])
