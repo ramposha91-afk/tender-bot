@@ -591,17 +591,31 @@ async def tp_request_post(session: aiohttp.ClientSession, url: str, payload: dic
 
 
 async def tp_search_by_key(session: aiohttp.ClientSession, page: int = 1, count: int = 50) -> list:
+    # Tenderplan /relations/v2/list требует participants и customers даже если фильтр пустой.
     return await tp_request_post(
         session, f"{TENDERPLAN_API}/relations/v2/list",
-        {"keyId": TENDERPLAN_KEY_ID, "page": page, "count": count}
+        {
+            "keyId": TENDERPLAN_KEY_ID,
+            "page": page,
+            "count": count,
+            "participants": [],
+            "customers": [],
+        },
     )
 
 
 async def tp_search_by_words(session: aiohttp.ClientSession, page: int = 1, count: int = 50) -> list:
+    # Резервный поиск. Добавляем participants/customers на случай единых требований валидатора API.
     return await tp_request_post(
         session, f"{TENDERPLAN_API}/search/list",
-        {"words": {"value": TENDERPLAN_WORDS, "excluded": TENDERPLAN_EXCLUDED},
-         "condition": "or", "page": page, "count": count}
+        {
+            "words": {"value": TENDERPLAN_WORDS, "excluded": TENDERPLAN_EXCLUDED},
+            "condition": "or",
+            "page": page,
+            "count": count,
+            "participants": [],
+            "customers": [],
+        },
     )
 
 
