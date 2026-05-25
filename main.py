@@ -7,6 +7,7 @@ Start command: python main.py
 ENV:
 - BOT_TOKEN
 - TENDERPLAN_TOKEN
+"""
 
 import asyncio
 import csv
@@ -49,18 +50,20 @@ REQUEST_TIMEOUT = 40
 REQUEST_DELAY = 1.2
 MAX_RETRIES = 3
 
-# Запросы
+# Поисковые запросы — используем проверенные ключевые слова по одному
 SEARCH_TERMS: list[str] = [
+    "металлолом",
+    "лом черных металлов",
+    "лом цветных металлов",
     "лом алюминия",
     "лом меди",
     "лом латуни",
-    "лом черных металлов",
-    "лом цветных металлов",
-    "стружка алюминиевая",
-    "стружка медная",
-    "стружка латунная",
+    "стружка металлическая",
     "отходы черных металлов",
     "отходы цветных металлов",
+    "демонтаж металлоконструкций",
+    "прием лома",
+    "реализация лома",
 ]
 
 # Мусор
@@ -507,8 +510,8 @@ async def export_csv_bytes() -> bytes:
 # =============================================================================
 
 def api_headers() -> dict[str, str]:
-    # Tenderplan принимает access_token в payload/params.
     return {
+        "Authorization": f"Bearer {TENDERPLAN_TOKEN}",
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -521,7 +524,6 @@ async def tp_search(
     count: int = 50,
 ) -> list[dict[str, Any]]:
     payload = {
-        "access_token": TENDERPLAN_TOKEN,
         "text": keyword,
         "page": page,
         "count": count,
