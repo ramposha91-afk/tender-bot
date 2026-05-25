@@ -675,54 +675,48 @@ async def run_update(bot: Optional[Bot] = None, notify: bool = True) -> tuple[in
 
         connector = aiohttp.TCPConnector(limit=5)
         async with aiohttp.ClientSession(connector=connector) as session:
-            for keyword in SEARCH_TERMS:
-                raw_items = await tp_search(session, keyword, page=1, count=50)
-
-                parsed_count = 0
-                duplicate_count = 0
-                saved_count = 0
-                filtered_count = 0
-
-                for item in raw_items:
-                    parsed = parse_tender(item, keyword)
-                    if not parsed:
-                        continue
-
-                    parsed_count += 1
-
-                    # Дубли внутри одного прохода не сохраняем.
-                    if parsed["tender_id"] in seen_ids:
-                        duplicate_count += 1
-                        continue
-                    seen_ids.add(parsed["tender_id"])
-
-                    if not is_relevant_tender(parsed.get("title", ""), parsed.get("keyword", "")):
-                        filtered_count += 1
-                        logger.info(
-                            "ОТФИЛЬТРОВАНО [%s]: %s",
-                            keyword,
-                            parsed.get("title", "")[:250],
-                        )
-                        continue
-
-                    is_new = await upsert_tender(parsed)
-                    if is_new:
-                        saved_count += 1
-                        new_tenders.append(parsed)
-                    else:
-                        duplicate_count += 1
-
-                logger.info(
-                    "Tenderplan '%s': raw=%d, parsed=%d, duplicates=%d, saved_new=%d, filtered/skipped=%d",
-                    keyword,
-                    len(raw_items),
-                    parsed_count,
-                    duplicate_count,
-                    saved_count,
-                    filtered_count,
-                )
-
+            # Сначала пробуем по вашему ключу — самый точный результат
+            all_raw_items = []
+            for page_num in range(1, 6):
+                raw = await tp_search_by_key(session, page=page_num, count=50)
+                if not raw:
+                    break
+                all_raw_items.extend(raw)
                 await asyncio.sleep(REQUEST_DELAY)
+
+            # Если ключ недоступен — используем запасной поиск
+            if not all_raw_items:
+                logger.info("Ключ недоступен, используем запасной поиск")
+                raw = await tp_search(session, page=1, count=50)
+                all_raw_items.extend(raw)
+
+            logger.info("Всего получено из API: %d", len(all_raw_items))
+
+            parsed_count = saved_count = filtered_count = duplicate_count = 0
+            for item in all_raw_items:
+                parsed = parse_tender(item, "металлолом")
+                if not parsed:
+                    continue
+                parsed_count += 1
+                if parsed["tender_id"] in seen_ids:
+                    duplicate_count += 1
+                    continue
+                seen_ids.add(parsed["tender_id"])
+                if not is_relevant_tender(parsed.get("title", ""), parsed.get("keyword", "")):
+                    filtered_count += 1
+                    logger.info("ОТФИЛЬТРОВАНО: %s", parsed.get("title", "")[:150])
+                    continue
+                is_new = await upsert_tender(parsed)
+                if is_new:
+                    saved_count += 1
+                    new_tenders.append(parsed)
+                else:
+                    duplicate_count += 1
+
+            logger.info(
+                "Итого: raw=%d, parsed=%d, new=%d, duplicates=%d, filtered=%d",
+                len(all_raw_items), parsed_count, saved_count, duplicate_count, filtered_count,
+            )
 
         all_tenders = await get_tenders(limit=1000, only_active=False)
         active = [t for t in all_tenders if (t.get("status_code") or 1) in (1, 2)]
