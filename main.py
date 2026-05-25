@@ -8,11 +8,6 @@ ENV:
 - BOT_TOKEN
 - TENDERPLAN_TOKEN
 
-Важно:
-- запускать только как Background Worker, НЕ Web Service
-- должен быть только один активный инстанс бота с одним BOT_TOKEN
-"""
-
 import asyncio
 import csv
 import html
@@ -54,7 +49,7 @@ REQUEST_TIMEOUT = 40
 REQUEST_DELAY = 1.2
 MAX_RETRIES = 3
 
-# Узкие запросы. Широкие типа "прием лома" и "реализация лома" дают мусор.
+# Запросы
 SEARCH_TERMS: list[str] = [
     "лом алюминия",
     "лом меди",
@@ -68,8 +63,7 @@ SEARCH_TERMS: list[str] = [
     "отходы цветных металлов",
 ]
 
-# Явный мусор. Фильтр мягкий: доверяем ключевому запросу Tenderplan,
-# но режем очевидно чужие закупки.
+# Мусор
 FORBIDDEN_PATTERNS: list[str] = [
     r"канцеляр",
     r"канцтовар",
@@ -103,10 +97,12 @@ FORBIDDEN_PATTERNS: list[str] = [
     r"асфальт",
     r"услуги охран",
     r"страхован",
+    r"сигнализац",
+    r"клапан",
+    r"шнур",
 ]
 
-# Позитивные признаки. Проверяем title + keyword вместе, чтобы не выкидывать
-# результаты, где API вернул короткое/кривое название.
+# Паттерны
 GOOD_PATTERNS: list[str] = [
     r"\bлом\b",
     r"металлолом",
