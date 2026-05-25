@@ -519,7 +519,9 @@ async def tp_search(
     count: int = 50,
 ) -> list[dict[str, Any]]:
     payload = {
-        "text": keyword,
+        "words": {"value": keyword},
+        "statuses": [],
+        "condition": "and",
         "page": page,
         "count": count,
     }
