@@ -570,6 +570,49 @@ async def tp_search(
     return []
 
 
+async def tp_search_by_key(
+    session: aiohttp.ClientSession,
+    page: int = 1,
+    count: int = 50,
+) -> list[dict[str, Any]]:
+    """Получить тендеры по вашему настроенному ключу — самый точный метод."""
+    payload = {
+        "keyId": TENDERPLAN_KEY_ID,
+        "page": page,
+        "count": count,
+    }
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.post(
+                f"{TENDERPLAN_API}/relations/v2/list",
+                json=payload,
+                headers=api_headers(),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as resp:
+                body = await resp.text()
+                if resp.status == 200:
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception:
+                        return []
+                    tenders = data.get("tenders", []) if isinstance(data, dict) else []
+                    logger.info("Key search: page=%d, найдено=%d", page, len(tenders))
+                    return tenders
+                elif resp.status in (403, 404):
+                    logger.warning("Key search %s — нет прав или ключ не найден", resp.status)
+                    return []
+                elif resp.status == 429:
+                    await asyncio.sleep(10)
+                else:
+                    logger.warning("Key search HTTP %s: %s", resp.status, body[:200])
+                    return []
+        except Exception as e:
+            logger.warning("Key search error (attempt %d): %s", attempt, e)
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(2 * attempt)
+    return []
+
+
 def parse_tender(item: dict[str, Any], keyword: str) -> Optional[dict[str, Any]]:
     tender_id = item.get("_id") or item.get("id") or item.get("tenderId")
     if not tender_id:
